@@ -105,13 +105,56 @@ class SPN1Driver:
         before = self.get_device_time()
         date_command = f"Y{dt_local:%Y/%m/%d}"
         time_command = f"H{dt_local:%H:%M:%S}"
+        test_response = ""
+        date_response = ""
+        time_response = ""
+        run_response = ""
+        verify_response = ""
+        step = "start"
 
         try:
             with self._lock:
-                test_response = self._send_command("T")
-                date_response = self._send_command(date_command)
-                time_response = self._send_command(time_command)
-                run_response = self._send_command("R")
+                instrument = self._open(read_timeout_s=0.05)
+                if hasattr(instrument, "reset_input_buffer"):
+                    instrument.reset_input_buffer()
+
+                step = "enter_test_mode"
+                test_response = self._enter_test_mode()
+                if "TEST" not in test_response:
+                    return {
+                        "status": "error",
+                        "timestamp": self._utc_timestamp(),
+                        "before": before,
+                        "after": None,
+                        "step": "enter_test_mode",
+                        "response_T": self._bound_debug(test_response),
+                        "response_Y": "",
+                        "response_H": "",
+                        "response_R": self._bound_debug(run_response),
+                        "response_Z": "",
+                        "error": "SPN1 did not enter TEST mode",
+                    }
+
+                step = "Y"
+                self._write_raw(date_command.encode("ascii"))
+                date_response = self._read_until(
+                    lambda text: "TEST:" in text or self._parse_spn1_datetime(text) is not None,
+                    timeout_s=1.5,
+                )
+
+                step = "H"
+                self._write_raw(time_command.encode("ascii"))
+                time_response = self._read_until(
+                    lambda text: "TEST:" in text or self._parse_spn1_datetime(text) is not None,
+                    timeout_s=1.5,
+                )
+
+                step = "R"
+                self._write_raw(b"R")
+                run_response = self._read_available_for(0.4)
+
+                step = "Z"
+                time.sleep(0.2)
                 verify_response = self._send_command("Z")
         except Exception as exc:
             self._close()
@@ -120,6 +163,12 @@ class SPN1Driver:
                 "timestamp": self._utc_timestamp(),
                 "before": before,
                 "after": None,
+                "step": step,
+                "response_T": self._bound_debug(test_response),
+                "response_Y": self._bound_debug(date_response),
+                "response_H": self._bound_debug(time_response),
+                "response_R": self._bound_debug(run_response),
+                "response_Z": self._bound_debug(verify_response),
                 "error": str(exc),
             }
 
@@ -137,6 +186,16 @@ class SPN1Driver:
             else None
         )
         verified = delta_seconds is not None and delta_seconds <= 5
+        debug = {}
+        if not verified:
+            debug = {
+                "step": "verify",
+                "response_T": self._bound_debug(test_response),
+                "response_Y": self._bound_debug(date_response),
+                "response_H": self._bound_debug(time_response),
+                "response_R": self._bound_debug(run_response),
+                "response_Z": self._bound_debug(verify_response),
+            }
 
         return {
             "status": "ok" if verified else "error",
@@ -151,6 +210,33 @@ class SPN1Driver:
                 "run_mode": run_response,
             },
             "error": None if verified else "SPN1 time verification mismatch",
+            **debug,
+        }
+
+    def probe_test_mode_entry(self) -> dict:
+        try:
+            with self._lock:
+                instrument = self._open(read_timeout_s=0.05)
+                if hasattr(instrument, "reset_input_buffer"):
+                    instrument.reset_input_buffer()
+                self._write_raw(b"R")
+                response_r = self._read_available_for(0.6)
+                response_t = self._enter_test_mode()
+        except Exception as exc:
+            self._close()
+            return {
+                "status": "error",
+                "timestamp": self._utc_timestamp(),
+                "response_R": "",
+                "response_T": "",
+                "error": str(exc),
+            }
+
+        return {
+            "status": "ok" if "TEST" in response_t else "error",
+            "timestamp": self._utc_timestamp(),
+            "response_R": self._bound_debug(response_r),
+            "response_T": self._bound_debug(response_t),
         }
 
     def _send_command(self, command: str, read_timeout_s: float = 1.0) -> str:
@@ -172,6 +258,66 @@ class SPN1Driver:
             time.sleep(0.05)
             raw_line = instrument.readline(256)
             return raw_line.decode("ascii", errors="ignore").strip()
+
+    def _enter_test_mode(self) -> str:
+        self._write_raw(b"T")
+        return self._read_until(lambda text: "TEST" in text, timeout_s=2.5)
+
+    def _write_command(self, command: str) -> None:
+        if serial is None:
+            raise RuntimeError("pyserial is not installed")
+
+        self._write_raw(f"{command}\r".encode("ascii"))
+
+    def _write_raw(self, data: bytes) -> None:
+        if serial is None:
+            raise RuntimeError("pyserial is not installed")
+
+        instrument = self._open(read_timeout_s=0.05)
+        instrument.write(data)
+        if hasattr(instrument, "flush"):
+            instrument.flush()
+
+    def _read_until(self, predicate, timeout_s: float) -> str:
+        deadline = time.monotonic() + timeout_s
+        chunks = []
+
+        while time.monotonic() < deadline:
+            chunk = self._read_available_chunk()
+            if chunk:
+                chunks.append(chunk)
+                text = "".join(chunks)
+                if predicate(text):
+                    return self._bound_debug(text)
+            else:
+                time.sleep(0.03)
+
+        return self._bound_debug("".join(chunks))
+
+    def _read_available_for(self, duration_s: float) -> str:
+        deadline = time.monotonic() + duration_s
+        chunks = []
+
+        while time.monotonic() < deadline:
+            chunk = self._read_available_chunk()
+            if chunk:
+                chunks.append(chunk)
+            else:
+                time.sleep(0.03)
+
+        return self._bound_debug("".join(chunks))
+
+    def _read_available_chunk(self) -> str:
+        instrument = self._open(read_timeout_s=0.05)
+        waiting = getattr(instrument, "in_waiting", 0) or 0
+        size = max(1, min(waiting, 256))
+        data = instrument.read(size)
+        return data.decode("ascii", errors="ignore")
+
+    def _bound_debug(self, text: str, limit: int = 500) -> str:
+        if len(text) <= limit:
+            return text
+        return text[-limit:]
 
     def _open(self, read_timeout_s: float = 1.0):
         if self._instrument is None or not self._instrument.is_open:
