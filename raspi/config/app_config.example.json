@@ -1,14 +1,16 @@
 {
-  "app_id": "bb-example-monitor",
+  "app_id": "solar-monitor",
   "mode": "sensor_monitor",
-  "poll_interval_ms": 1000,
-  "title": "Example Deployment Monitor",
+  "poll_interval_ms": 1500,
+  "title": "Solar Monitor",
   "drivers": [
     {
-      "driver": "example",
-      "uid": "bb-0000",
-      "config": {}
+      "driver": "spn1",
+      "uid": "spn1-0001",
+      "config": {
+        "port": "/dev/cu.PL2303G-USBtoUART1130",
+        "baud": 9600
+      }
     }
   ]
 }
-
