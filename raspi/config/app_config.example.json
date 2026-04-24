@@ -1,0 +1,14 @@
+{
+  "app_id": "bb-example-monitor",
+  "mode": "sensor_monitor",
+  "poll_interval_ms": 1000,
+  "title": "Example Deployment Monitor",
+  "drivers": [
+    {
+      "driver": "example",
+      "uid": "bb-0000",
+      "config": {}
+    }
+  ]
+}
+
