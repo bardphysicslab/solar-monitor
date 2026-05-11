@@ -1,5 +1,5 @@
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Optional
 import re
 import threading
 import time
@@ -36,7 +36,7 @@ class SPN1Driver:
                 "diffuse_w_m2": {"label": "Diffuse radiation", "unit": "W/m2"},
                 "sun": {"label": "Sun state", "unit": "boolean"},
             },
-            "raw_available": False,
+            "raw_available": True,
         }
 
     def get_controls(self) -> dict:
@@ -47,17 +47,26 @@ class SPN1Driver:
         }
 
     def get_reading(self) -> dict:
+        raw = ""
         try:
-            line = self._send_command("S")
-            parsed = self._parse_line(line)
-        except Exception:
+            raw = self._send_command("S", response_delay_s=0.3, read_window_s=0.8)
+            parsed = self._parse_reading(raw)
+
+            if parsed is None:
+                # One retry helps after wake-up / junk bytes.
+                time.sleep(0.15)
+                raw = self._send_command("S", response_delay_s=0.3, read_window_s=0.8)
+                parsed = self._parse_reading(raw)
+
+        except Exception as exc:
             self._close()
-            parsed = None
+            return self._error_reading(error=str(exc), raw=raw)
 
         if parsed is None:
-            return self._error_reading()
+            return self._error_reading(error="Could not parse SPN1 reading", raw=raw)
 
         total_w_m2, diffuse_w_m2, sun = parsed
+
         return {
             "uid": self.uid,
             "timestamp": self._utc_timestamp(),
@@ -68,12 +77,12 @@ class SPN1Driver:
                 "sun": sun,
             },
             "extended": {},
-            "raw": None,
+            "raw": raw,
         }
 
     def get_device_status(self) -> dict:
         try:
-            response = self._send_command("I")
+            response = self._send_command("I", response_delay_s=0.4, read_window_s=1.2)
         except Exception as exc:
             self._close()
             return self._control_error(str(exc))
@@ -87,24 +96,28 @@ class SPN1Driver:
 
     def get_device_time(self) -> dict:
         try:
-            response = self._send_command("Z")
+            response = self._send_command("Z", response_delay_s=0.3, read_window_s=1.0)
         except Exception as exc:
             self._close()
             return self._device_time_error(str(exc))
 
         parsed = self._parse_spn1_datetime(response)
+
         return {
-            "status": "ok",
+            "status": "ok" if parsed else "error",
             "timestamp": self._utc_timestamp(),
             "device_time_local": self._format_device_time(parsed) if parsed else None,
             "parsed": parsed is not None,
             "raw": response,
+            "error": None if parsed else "Could not parse SPN1 time",
         }
 
     def sync_device_time(self, dt_local: datetime) -> dict:
         before = self.get_device_time()
+
         date_command = f"Y{dt_local:%Y/%m/%d}"
         time_command = f"H{dt_local:%H:%M:%S}"
+
         test_response = ""
         date_response = ""
         time_response = ""
@@ -115,8 +128,7 @@ class SPN1Driver:
         try:
             with self._lock:
                 instrument = self._open(read_timeout_s=0.05)
-                if hasattr(instrument, "reset_input_buffer"):
-                    instrument.reset_input_buffer()
+                self._reset_input(instrument)
 
                 step = "enter_test_mode"
                 test_response = self._enter_test_mode()
@@ -126,36 +138,37 @@ class SPN1Driver:
                         "timestamp": self._utc_timestamp(),
                         "before": before,
                         "after": None,
-                        "step": "enter_test_mode",
+                        "step": step,
                         "response_T": self._bound_debug(test_response),
                         "response_Y": "",
                         "response_H": "",
-                        "response_R": self._bound_debug(run_response),
+                        "response_R": "",
                         "response_Z": "",
                         "error": "SPN1 did not enter TEST mode",
                     }
 
                 step = "Y"
-                self._write_raw(date_command.encode("ascii"))
+                self._write_raw(f"{date_command}\r".encode("ascii"))
                 date_response = self._read_until(
                     lambda text: "TEST:" in text or self._parse_spn1_datetime(text) is not None,
                     timeout_s=1.5,
                 )
 
                 step = "H"
-                self._write_raw(time_command.encode("ascii"))
+                self._write_raw(f"{time_command}\r".encode("ascii"))
                 time_response = self._read_until(
                     lambda text: "TEST:" in text or self._parse_spn1_datetime(text) is not None,
                     timeout_s=1.5,
                 )
 
                 step = "R"
-                self._write_raw(b"R")
-                run_response = self._read_available_for(0.4)
+                self._write_raw(b"R\r")
+                run_response = self._read_available_for(0.5)
 
                 step = "Z"
-                time.sleep(0.2)
-                verify_response = self._send_command("Z")
+                time.sleep(0.25)
+                verify_response = self._send_command("Z", response_delay_s=0.3, read_window_s=1.0)
+
         except Exception as exc:
             self._close()
             return {
@@ -173,6 +186,7 @@ class SPN1Driver:
             }
 
         parsed_after = self._parse_spn1_datetime(verify_response)
+
         after = {
             "status": "ok" if parsed_after else "error",
             "timestamp": self._utc_timestamp(),
@@ -180,22 +194,14 @@ class SPN1Driver:
             "parsed": parsed_after is not None,
             "raw": verify_response,
         }
+
         delta_seconds = (
             abs((parsed_after - dt_local.replace(tzinfo=None)).total_seconds())
             if parsed_after
             else None
         )
+
         verified = delta_seconds is not None and delta_seconds <= 5
-        debug = {}
-        if not verified:
-            debug = {
-                "step": "verify",
-                "response_T": self._bound_debug(test_response),
-                "response_Y": self._bound_debug(date_response),
-                "response_H": self._bound_debug(time_response),
-                "response_R": self._bound_debug(run_response),
-                "response_Z": self._bound_debug(verify_response),
-            }
 
         return {
             "status": "ok" if verified else "error",
@@ -204,24 +210,26 @@ class SPN1Driver:
             "after": after,
             "delta_seconds": delta_seconds,
             "responses": {
-                "test_mode": test_response,
-                "date_set": date_response,
-                "time_set": time_response,
-                "run_mode": run_response,
+                "test_mode": self._bound_debug(test_response),
+                "date_set": self._bound_debug(date_response),
+                "time_set": self._bound_debug(time_response),
+                "run_mode": self._bound_debug(run_response),
+                "verify": self._bound_debug(verify_response),
             },
             "error": None if verified else "SPN1 time verification mismatch",
-            **debug,
         }
 
     def probe_test_mode_entry(self) -> dict:
         try:
             with self._lock:
                 instrument = self._open(read_timeout_s=0.05)
-                if hasattr(instrument, "reset_input_buffer"):
-                    instrument.reset_input_buffer()
-                self._write_raw(b"R")
+                self._reset_input(instrument)
+
+                self._write_raw(b"R\r")
                 response_r = self._read_available_for(0.6)
+
                 response_t = self._enter_test_mode()
+
         except Exception as exc:
             self._close()
             return {
@@ -239,35 +247,40 @@ class SPN1Driver:
             "response_T": self._bound_debug(response_t),
         }
 
-    def _send_command(self, command: str, read_timeout_s: float = 1.0) -> str:
+    # ---------- Serial helpers ----------
+
+    def _send_command(
+        self,
+        command: str,
+        response_delay_s: float = 0.25,
+        read_window_s: float = 0.75,
+        read_timeout_s: float = 0.05,
+    ) -> str:
         """
-        Send one SPN1 command and return bounded decoded response.
-        Use CR line ending because SPN1 manual and observed hardware use CR.
-        Keep this vendor-specific behavior inside the driver.
+        Send one SPN1 RS232 command.
+
+        SPN1 responses can contain junk/wake-up bytes before the useful ASCII.
+        So we do not rely on readline(). We read a short time window and let
+        the parser search inside the whole response.
         """
         if serial is None:
             raise RuntimeError("pyserial is not installed")
 
         with self._lock:
             instrument = self._open(read_timeout_s=read_timeout_s)
-            if hasattr(instrument, "reset_input_buffer"):
-                instrument.reset_input_buffer()
+            self._reset_input(instrument)
+
             instrument.write(f"{command}\r".encode("ascii"))
             if hasattr(instrument, "flush"):
                 instrument.flush()
-            time.sleep(0.05)
-            raw_line = instrument.readline(256)
-            return raw_line.decode("ascii", errors="ignore").strip()
+
+            time.sleep(response_delay_s)
+
+            return self._read_available_for(read_window_s)
 
     def _enter_test_mode(self) -> str:
-        self._write_raw(b"T")
+        self._write_raw(b"T\r")
         return self._read_until(lambda text: "TEST" in text, timeout_s=2.5)
-
-    def _write_command(self, command: str) -> None:
-        if serial is None:
-            raise RuntimeError("pyserial is not installed")
-
-        self._write_raw(f"{command}\r".encode("ascii"))
 
     def _write_raw(self, data: bytes) -> None:
         if serial is None:
@@ -314,33 +327,64 @@ class SPN1Driver:
         data = instrument.read(size)
         return data.decode("ascii", errors="ignore")
 
-    def _bound_debug(self, text: str, limit: int = 500) -> str:
-        if len(text) <= limit:
-            return text
-        return text[-limit:]
-
     def _open(self, read_timeout_s: float = 1.0):
+        if serial is None:
+            raise RuntimeError("pyserial is not installed")
+
         if self._instrument is None or not self._instrument.is_open:
-            self._instrument = serial.Serial(self.port, self.baud, timeout=read_timeout_s)
+            self._instrument = serial.Serial(
+                port=self.port,
+                baudrate=self.baud,
+                bytesize=serial.EIGHTBITS,
+                parity=serial.PARITY_NONE,
+                stopbits=serial.STOPBITS_ONE,
+                timeout=read_timeout_s,
+                write_timeout=1.0,
+                xonxoff=False,
+                rtscts=False,
+                dsrdtr=False,
+            )
+
+            # SPN1 may use DTR power on real RS232 adapters.
+            try:
+                self._instrument.setDTR(True)
+            except Exception:
+                pass
+
         else:
             self._instrument.timeout = read_timeout_s
+
         return self._instrument
+
+    def _reset_input(self, instrument) -> None:
+        if hasattr(instrument, "reset_input_buffer"):
+            instrument.reset_input_buffer()
 
     def _close(self) -> None:
         if self._instrument is None:
             return
+
         try:
             self._instrument.close()
         finally:
             self._instrument = None
 
-    def _parse_line(self, line: str) -> Optional[tuple[float, float, int]]:
-        # SPN1 replies can include startup/junk bytes before or after the useful record.
-        # Valid sample example: "S    1.1,    0.0,0"
+    # ---------- Parsers ----------
+
+    def _parse_reading(self, text: str) -> Optional[tuple[float, float, int]]:
+        """
+        Accept both:
+          S   11.1,    8.8,0
+        and:
+          11.1,    8.8,0
+
+        Also tolerates junk before/after.
+        """
         match = re.search(
-            r"S\s*([-+]?\d+(?:\.\d+)?)\s*,\s*([-+]?\d+(?:\.\d+)?)\s*,\s*([01])",
-            line,
+            r"(?:^|S|\s)([-+]?\d+(?:\.\d+)?)\s*,\s*([-+]?\d+(?:\.\d+)?)\s*,\s*([01])",
+            text,
         )
+
         if not match:
             return None
 
@@ -351,6 +395,7 @@ class SPN1Driver:
             r"(\d{4})/(\d{2})/(\d{2})\s+(\d{2}):(\d{2}):(\d{2})",
             text,
         )
+
         if not match:
             return None
 
@@ -366,8 +411,33 @@ class SPN1Driver:
         except ValueError:
             return None
 
+    # ---------- Formatting / errors ----------
+
     def _format_device_time(self, value: datetime) -> str:
         return value.strftime("%Y/%m/%d %H:%M:%S")
+
+    def _bound_debug(self, text: str, limit: int = 500) -> str:
+        if text is None:
+            return ""
+        if len(text) <= limit:
+            return text
+        return text[-limit:]
+
+    def _error_reading(self, error: str = "SPN1 read failed", raw: str = "") -> dict:
+        return {
+            "uid": self.uid,
+            "timestamp": self._utc_timestamp(),
+            "status": "error",
+            "data": {
+                "total_w_m2": None,
+                "diffuse_w_m2": None,
+                "sun": None,
+            },
+            "extended": {
+                "error": error,
+            },
+            "raw": self._bound_debug(raw),
+        }
 
     def _control_error(self, error: str) -> dict:
         return {
@@ -386,20 +456,6 @@ class SPN1Driver:
             "parsed": False,
             "raw": None,
             "error": error,
-        }
-
-    def _error_reading(self) -> dict:
-        return {
-            "uid": self.uid,
-            "timestamp": self._utc_timestamp(),
-            "status": "error",
-            "data": {
-                "total_w_m2": None,
-                "diffuse_w_m2": None,
-                "sun": None,
-            },
-            "extended": {},
-            "raw": None,
         }
 
     def _utc_timestamp(self) -> str:

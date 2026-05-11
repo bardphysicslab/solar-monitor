@@ -310,6 +310,16 @@
           </div>
         </section>
 
+        <section class="card chart-panel">
+          <div class="chart-header">
+            <h2 class="chart-title">Sunshine</h2>
+            <div class="reading"><span id="sun-value">—</span></div>
+          </div>
+          <div class="chart-wrap">
+            <canvas id="sun-chart"></canvas>
+          </div>
+        </section>
+
         <section class="card chart-panel time-card">
           <div class="chart-header">
             <h2 class="chart-title">SPN1 Time</h2>
@@ -341,10 +351,9 @@
       const spn1TimeResultEl = document.getElementById("spn1-time-result");
       const spn1TimeMessageEl = document.getElementById("spn1-time-message");
       const spn1TimeSyncButton = document.getElementById("spn1-time-sync");
+      const sunValueEl = document.getElementById("sun-value");
       let lastTimestamp = null;
       let runActive = false;
-      let deviceTimeAtFetch = null;
-      let deviceFetchedAtMs = null;
 
       Chart.defaults.color = "#a7a7a7";
       Chart.defaults.borderColor = "rgba(255, 255, 255, 0.12)";
@@ -397,6 +406,50 @@
 
       const totalChart = makeChart("total-chart", "Total radiation", "#58a6ff");
       const diffuseChart = makeChart("diffuse-chart", "Diffuse radiation", "#52d273");
+      const sunChart = new Chart(document.getElementById("sun-chart"), {
+        type: "line",
+        data: {
+          labels: [],
+          datasets: [
+            {
+              label: "Sun",
+              data: [],
+              borderColor: "#f2cc60",
+              backgroundColor: "#f2cc60",
+              borderWidth: 2,
+              pointRadius: 0,
+              tension: 0,
+              stepped: true,
+            },
+          ],
+        },
+        options: {
+          animation: false,
+          maintainAspectRatio: false,
+          responsive: true,
+          scales: {
+            x: {
+              ticks: {
+                maxRotation: 0,
+                autoSkip: true,
+                maxTicksLimit: 8,
+              },
+            },
+            y: {
+              min: 0,
+              max: 1,
+              ticks: {
+                stepSize: 1,
+                callback: v => (v === 1 ? "Sun" : "No Sun"),
+              },
+            },
+          },
+          plugins: {
+            legend: { display: false },
+          },
+        },
+      });
+
 
       function formatTime(timestamp) {
         return new Date(timestamp).toLocaleTimeString([], {
@@ -421,13 +474,17 @@
         lastTimestamp = reading.timestamp;
 
         const data = reading.data || {};
+        const extended = reading.extended || {};
         const label = formatTime(reading.timestamp);
         if (reading.status !== "ok") return;
 
         totalValueEl.textContent = Number(data.total_w_m2).toFixed(1);
         diffuseValueEl.textContent = Number(data.diffuse_w_m2).toFixed(1);
+        sunValueEl.textContent = data.sun === 1 ? "Sun" : "No sun";
         pushPoint(totalChart, label, data.total_w_m2);
         pushPoint(diffuseChart, label, data.diffuse_w_m2);
+        pushPoint(sunChart, label, data.sun);
+        updateSpn1TimeFromReading(reading, extended);
       }
 
       async function setRunActive(active) {
@@ -459,47 +516,33 @@
         clockUtcEl.textContent = `UTC ${time.utc || "--"}`;
       }
 
-      function parseDeviceTime(value) {
-        if (!value) return null;
-        const match = value.match(/^(\d{4})\/(\d{2})\/(\d{2}) (\d{2}):(\d{2}):(\d{2})$/);
-        if (!match) return null;
-        return new Date(
-          Number(match[1]),
-          Number(match[2]) - 1,
-          Number(match[3]),
-          Number(match[4]),
-          Number(match[5]),
-          Number(match[6]),
-        );
-      }
-
-      function formatDeviceTime(value) {
-        const year = value.getFullYear();
-        const month = String(value.getMonth() + 1).padStart(2, "0");
-        const day = String(value.getDate()).padStart(2, "0");
-        const hour = String(value.getHours()).padStart(2, "0");
-        const minute = String(value.getMinutes()).padStart(2, "0");
-        const second = String(value.getSeconds()).padStart(2, "0");
-        return `${year}/${month}/${day} ${hour}:${minute}:${second}`;
-      }
-
-      function renderEstimatedDeviceTime() {
-        if (!deviceTimeAtFetch || deviceFetchedAtMs === null) {
-          spn1UnitTimeEl.textContent = "Unavailable";
+      function updateSpn1TimeFromReading(reading, extended) {
+        const spn1Time = extended.spn1_time_local || extended.spn1_time || null;
+        if (spn1Time) {
+          spn1UnitTimeEl.textContent = spn1Time;
+          spn1TimeStatusEl.textContent = "Available";
+          spn1TimeResultEl.textContent = "Updated with latest reading";
           return;
         }
-        const elapsedMs = Date.now() - deviceFetchedAtMs;
-        spn1UnitTimeEl.textContent = formatDeviceTime(new Date(deviceTimeAtFetch.getTime() + elapsedMs));
+
+        if (reading.timestamp) {
+          spn1UnitTimeEl.textContent = new Date(reading.timestamp).toLocaleString();
+          spn1TimeStatusEl.textContent = "Server timestamp";
+          spn1TimeResultEl.textContent = "No SPN1 timestamp in latest reading";
+          return;
+        }
+
+        spn1UnitTimeEl.textContent = "Unavailable";
+        spn1TimeStatusEl.textContent = "Unavailable";
+        spn1TimeResultEl.textContent = "Unavailable";
       }
 
       function showDeviceTime(payload) {
         const parsed = Boolean(payload && payload.parsed);
         const unitTime = parsed ? payload.device_time_local : null;
-        deviceTimeAtFetch = parseDeviceTime(unitTime);
-        deviceFetchedAtMs = deviceTimeAtFetch ? Date.now() : null;
         spn1TimeStatusEl.textContent = parsed ? "Available" : "Unavailable";
-        spn1TimeResultEl.textContent = parsed ? "SPN1 clock read successfully" : "SPN1 time unavailable";
-        renderEstimatedDeviceTime();
+        spn1UnitTimeEl.textContent = unitTime || "Unavailable";
+        spn1TimeResultEl.textContent = parsed ? "SPN1 clock refreshed after sync" : "Unavailable";
       }
 
       async function refreshSpn1Time() {
@@ -546,12 +589,6 @@
         refreshTime().catch(console.error);
       }, 1000);
 
-      refreshSpn1Time().catch(console.error);
-      setInterval(() => {
-        refreshSpn1Time().catch(console.error);
-      }, 45000);
-
-      setInterval(renderEstimatedDeviceTime, 1000);
     </script>
   </body>
 </html>

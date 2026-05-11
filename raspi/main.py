@@ -17,7 +17,7 @@ from raspi.drivers.spn1_driver import SPN1Driver
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
 TEMPLATES_DIR = BASE_DIR / "templates"
-DEFAULT_CONFIG_PATH = BASE_DIR / "config" / "app_config.example.json"
+DEFAULT_CONFIG_PATH = BASE_DIR / "config" / "app_config.json"
 
 app = FastAPI(title="Solar Monitor")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
@@ -56,7 +56,7 @@ def load_drivers(config: Dict[str, Any]) -> List[Any]:
             loaded.append(
                 SPN1Driver(
                     uid=uid,
-                    port=driver_config.get("port", "/dev/cu.PL2303G-USBtoUART1130"),
+                    port=driver_config.get("port", "/dev/cu.PL2303G-USBtoUART130"),
                     baud=int(driver_config.get("baud", 9600)),
                 )
             )
@@ -92,9 +92,20 @@ def is_run_active() -> bool:
 def polling_loop() -> None:
     while True:
         if is_run_active() and PRIMARY_DRIVER is not None:
-            reading = PRIMARY_DRIVER.get_reading()
-            if reading["status"] == "ok":
+            try:
+                reading = PRIMARY_DRIVER.get_reading()
                 set_latest_reading(reading)
+            except Exception as exc:
+                set_latest_reading(
+                    {
+                        "uid": "spn1-0001",
+                        "timestamp": utc_now().strftime("%Y-%m-%dT%H:%M:%SZ"),
+                        "status": "error",
+                        "data": {},
+                        "extended": {"error": str(exc)},
+                        "raw": None,
+                    }
+                )
             time.sleep(1.0)
         else:
             time.sleep(0.2)

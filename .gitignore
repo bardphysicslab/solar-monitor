@@ -6,4 +6,6 @@ __pycache__/
 .env
 data/*
 !data/.gitkeep
-
+# local runtime + config
+raspi/venv/
+raspi/config/app_config.json
