@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import threading
 import time
@@ -12,12 +13,14 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from raspi.drivers.spn1_driver import SPN1Driver
+from raspi.drivers.wifi_node_driver import WiFiNodeDriver
 
 
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
 TEMPLATES_DIR = BASE_DIR / "templates"
 DEFAULT_CONFIG_PATH = BASE_DIR / "config" / "app_config.json"
+logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Solar Monitor")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
@@ -60,6 +63,19 @@ def load_drivers(config: Dict[str, Any]) -> List[Any]:
                     baud=int(driver_config.get("baud", 9600)),
                 )
             )
+        elif driver_name == "wifi_node":
+            host = driver_config.get("host")
+            if not host:
+                raise ValueError(f"Wi-Fi node driver {uid} requires config.host")
+
+            loaded.append(
+                WiFiNodeDriver(
+                    uid=uid,
+                    host=host,
+                    port=int(driver_config.get("port", 1234)),
+                    timeout_s=float(driver_config.get("timeout_s", 3.0)),
+                )
+            )
         else:
             raise ValueError(f"Unsupported driver in solar monitor: {driver_name}")
     return loaded
@@ -96,9 +112,11 @@ def polling_loop() -> None:
                 reading = PRIMARY_DRIVER.get_reading()
                 set_latest_reading(reading)
             except Exception as exc:
+                primary_uid = getattr(PRIMARY_DRIVER, "uid", "unknown")
+                logger.warning("Primary driver polling failed for %s: %s", primary_uid, exc)
                 set_latest_reading(
                     {
-                        "uid": "spn1-0001",
+                        "uid": primary_uid,
                         "timestamp": utc_now().strftime("%Y-%m-%dT%H:%M:%SZ"),
                         "status": "error",
                         "data": {},

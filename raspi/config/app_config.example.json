@@ -5,6 +5,15 @@
   "title": "Solar Monitor",
   "drivers": [
     {
+      "driver": "wifi_node",
+      "uid": "bb-solar-pnl-001",
+      "config": {
+        "host": "REPLACE_WITH_ESP32_IP",
+        "port": 1234,
+        "timeout_s": 3
+      }
+    },
+    {
       "driver": "spn1",
       "uid": "spn1-0001",
       "config": {
