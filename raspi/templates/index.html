@@ -575,25 +575,34 @@
         return typeof value === "number" ? `${value.toFixed(3)} V` : "—";
       }
 
-      function renderWifiNodes(nodes) {
-        const cards = nodes || [];
+      function isSolarNodeReading(reading) {
+        const data = reading?.data || {};
+        const extended = reading?.extended || {};
+        return data.panel_voltage_v !== undefined || extended.node_type === "solar_panel";
+      }
+
+      function formatVoltageOk(value) {
+        if (value === 1 || value === true) return "OK";
+        if (value === 0 || value === false) return "NOT OK";
+        return "—";
+      }
+
+      function renderWifiNodes(readings) {
+        const cards = (readings || []).filter(isSolarNodeReading);
         if (!cards.length) {
-          wifiNodeListEl.innerHTML = '<section class="card chart-panel wifi-card"><div class="reading">No BardBox Wi-Fi nodes configured.</div></section>';
+          wifiNodeListEl.innerHTML = '<section class="card chart-panel wifi-card"><div class="reading">No BardBox solar node readings yet.</div></section>';
           return;
         }
 
-        wifiNodeListEl.innerHTML = cards.map((node) => {
-          const info = node.info || {};
-          const reading = node.latest_reading || {};
+        wifiNodeListEl.innerHTML = cards.map((reading) => {
           const data = reading.data || {};
           const extended = reading.extended || {};
           const isOnline = reading.status === "ok";
           const statusClass = isOnline ? "wifi-status-online" : "wifi-status-offline";
-          const statusText = isOnline ? "Online" : "Offline";
-          const error = reading.status === "error" ? extended.error : info.error;
-          const firmware = extended.fw || info.fw || info.firmware;
-          const rssi = extended.rssi_dbm ?? info.rssi_dbm;
-          const wifi = extended.wifi;
+          const statusText = isOnline ? "ONLINE" : "OFFLINE";
+          const error = reading.status === "error" ? extended.error : null;
+          const firmware = extended.fw || extended.firmware;
+          const rssi = extended.rssi_dbm;
           const timestamp = reading.timestamp ? new Date(reading.timestamp).toLocaleString() : "No reading yet";
           const errorMarkup = error ? `<div class="time-message">${escapeHtml(error)}</div>` : "";
 
@@ -601,16 +610,24 @@
             <section class="card chart-panel wifi-card">
               <div class="wifi-card-header">
                 <div>
-                  <h3 class="chart-title">BardBox Wi-Fi Node</h3>
-                  <div class="wifi-uid">${escapeHtml(info.uid || reading.uid || "Unknown UID")}</div>
+                  <h3 class="chart-title">Solar Panel Node</h3>
+                  <div class="wifi-uid">${escapeHtml(reading.uid || "Unknown UID")}</div>
                 </div>
                 <div class="${statusClass}">${escapeHtml(statusText)}</div>
               </div>
               <div class="wifi-voltage">${escapeHtml(formatVoltage(data.panel_voltage_v))}</div>
               <div class="wifi-details">
                 <div>
-                  <div class="wifi-detail-label">Wi-Fi</div>
-                  <div class="wifi-detail-value">${escapeHtml(wifi === 1 ? "Connected" : wifi === 0 ? "Disconnected" : "—")}</div>
+                  <div class="wifi-detail-label">UID</div>
+                  <div class="wifi-detail-value">${escapeHtml(reading.uid || "—")}</div>
+                </div>
+                <div>
+                  <div class="wifi-detail-label">Panel Voltage</div>
+                  <div class="wifi-detail-value">${escapeHtml(formatVoltage(data.panel_voltage_v))}</div>
+                </div>
+                <div>
+                  <div class="wifi-detail-label">Voltage OK</div>
+                  <div class="wifi-detail-value">${escapeHtml(formatVoltageOk(extended.voltage_ok))}</div>
                 </div>
                 <div>
                   <div class="wifi-detail-label">RSSI</div>
@@ -625,12 +642,8 @@
                   <div class="wifi-detail-value">${escapeHtml(timestamp)}</div>
                 </div>
                 <div>
-                  <div class="wifi-detail-label">IP</div>
-                  <div class="wifi-detail-value">${escapeHtml(formatValue(extended.ip || info.ip))}</div>
-                </div>
-                <div>
-                  <div class="wifi-detail-label">MAC</div>
-                  <div class="wifi-detail-value">${escapeHtml(formatValue(extended.mac || info.mac))}</div>
+                  <div class="wifi-detail-label">Online/Offline</div>
+                  <div class="wifi-detail-value ${statusClass}">${escapeHtml(statusText)}</div>
                 </div>
               </div>
               ${errorMarkup}
@@ -654,12 +667,16 @@
       }
 
       async function refreshState() {
-        const response = await fetch("/state");
-        const state = await response.json();
+        const [stateResponse, readingsResponse] = await Promise.all([
+          fetch("/state"),
+          fetch("/readings/latest"),
+        ]);
+        const state = await stateResponse.json();
+        const latest = await readingsResponse.json();
         runActive = Boolean(state.run_active);
         showRunState(runActive);
         updateSpn1Reading(state.latest_spn1_reading);
-        renderWifiNodes(state.wifi_nodes);
+        renderWifiNodes(latest.readings);
       }
 
       async function refreshTime() {
