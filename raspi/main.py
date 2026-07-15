@@ -27,7 +27,7 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
 
 run_active = False
-latest_reading: Optional[Dict[str, Any]] = None
+latest_readings_by_uid: Dict[str, Dict[str, Any]] = {}
 state_lock = threading.Lock()
 
 
@@ -94,10 +94,9 @@ def time_status() -> Dict[str, Any]:
     }
 
 
-def set_latest_reading(reading: Dict[str, Any]) -> None:
-    global latest_reading
+def set_latest_reading(uid: str, reading: Dict[str, Any]) -> None:
     with state_lock:
-        latest_reading = reading
+        latest_readings_by_uid[uid] = reading
 
 
 def is_run_active() -> bool:
@@ -105,33 +104,93 @@ def is_run_active() -> bool:
         return run_active
 
 
+def poll_all_drivers_once() -> None:
+    for driver in DRIVERS:
+        driver_uid = getattr(driver, "uid", "unknown")
+        try:
+            reading = driver.get_reading()
+            set_latest_reading(driver_uid, reading)
+        except Exception as exc:
+            logger.warning("Driver polling failed for %s: %s", driver_uid, exc)
+            set_latest_reading(
+                driver_uid,
+                {
+                    "uid": driver_uid,
+                    "timestamp": utc_now().strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "status": "error",
+                    "data": {},
+                    "extended": {"error": str(exc)},
+                    "raw": None,
+                },
+            )
+
+
 def polling_loop() -> None:
     while True:
-        if is_run_active() and PRIMARY_DRIVER is not None:
-            try:
-                reading = PRIMARY_DRIVER.get_reading()
-                set_latest_reading(reading)
-            except Exception as exc:
-                primary_uid = getattr(PRIMARY_DRIVER, "uid", "unknown")
-                logger.warning("Primary driver polling failed for %s: %s", primary_uid, exc)
-                set_latest_reading(
-                    {
-                        "uid": primary_uid,
-                        "timestamp": utc_now().strftime("%Y-%m-%dT%H:%M:%SZ"),
-                        "status": "error",
-                        "data": {},
-                        "extended": {"error": str(exc)},
-                        "raw": None,
-                    }
-                )
+        if is_run_active() and DRIVERS:
+            poll_all_drivers_once()
             time.sleep(1.0)
         else:
             time.sleep(0.2)
 
 
+def driver_payload(driver: Any) -> Dict[str, Any]:
+    return {
+        "info": driver.get_info(),
+        "capabilities": driver.get_capabilities(),
+    }
+
+
+def latest_reading_for_driver(driver: Any) -> Optional[Dict[str, Any]]:
+    driver_uid = getattr(driver, "uid", None)
+    if driver_uid is None:
+        return None
+
+    with state_lock:
+        return latest_readings_by_uid.get(driver_uid)
+
+
+def latest_primary_reading() -> Optional[Dict[str, Any]]:
+    if PRIMARY_DRIVER is not None:
+        return latest_reading_for_driver(PRIMARY_DRIVER)
+
+    with state_lock:
+        return next(iter(latest_readings_by_uid.values()), None)
+
+
+def latest_spn1_reading() -> Optional[Dict[str, Any]]:
+    with state_lock:
+        for driver in DRIVERS:
+            if isinstance(driver, SPN1Driver):
+                return latest_readings_by_uid.get(driver.uid)
+    return None
+
+
 def latest_readings() -> List[Dict[str, Any]]:
     with state_lock:
-        return [latest_reading] if latest_reading is not None else []
+        return [
+            latest_readings_by_uid[driver.uid]
+            for driver in DRIVERS
+            if getattr(driver, "uid", None) in latest_readings_by_uid
+        ]
+
+
+def wifi_node_cards() -> List[Dict[str, Any]]:
+    cards = []
+    for driver in DRIVERS:
+        if not isinstance(driver, WiFiNodeDriver):
+            continue
+
+        info = driver.get_info()
+        reading = latest_reading_for_driver(driver)
+        cards.append(
+            {
+                "info": info,
+                "capabilities": driver.get_capabilities(),
+                "latest_reading": reading,
+            }
+        )
+    return cards
 
 
 def get_spn1_driver() -> SPN1Driver:
@@ -191,8 +250,8 @@ def get_app_info():
 def get_app_health():
     return JSONResponse(
         {
-            "ok": PRIMARY_DRIVER is not None,
-            "status": "ok" if PRIMARY_DRIVER is not None else "degraded",
+            "ok": bool(DRIVERS),
+            "status": "ok" if DRIVERS else "degraded",
             "time_status": time_status(),
             "driver_count": len(DRIVERS),
             "run_active": is_run_active(),
@@ -204,12 +263,7 @@ def get_app_health():
 def get_drivers():
     payload = []
     for driver in DRIVERS:
-        payload.append(
-            {
-                "info": driver.get_info(),
-                "capabilities": driver.get_capabilities(),
-            }
-        )
+        payload.append(driver_payload(driver))
     return JSONResponse({"drivers": payload})
 
 
@@ -220,21 +274,18 @@ def get_latest_readings():
 
 @app.get("/state")
 def get_state():
-    driver_payload = None
-    if PRIMARY_DRIVER is not None:
-        driver_payload = {
-            "info": PRIMARY_DRIVER.get_info(),
-            "capabilities": PRIMARY_DRIVER.get_capabilities(),
+    drivers_payload = [driver_payload(driver) for driver in DRIVERS]
+    return JSONResponse(
+        {
+            "run_active": is_run_active(),
+            "latest_reading": latest_primary_reading(),
+            "latest_spn1_reading": latest_spn1_reading(),
+            "latest_readings": latest_readings(),
+            "driver": drivers_payload[0] if drivers_payload else None,
+            "drivers": drivers_payload,
+            "wifi_nodes": wifi_node_cards(),
         }
-
-    with state_lock:
-        return JSONResponse(
-            {
-                "run_active": run_active,
-                "latest_reading": latest_reading,
-                "driver": driver_payload,
-            }
-        )
+    )
 
 
 @app.get("/spn1/status")

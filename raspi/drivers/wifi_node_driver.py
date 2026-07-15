@@ -44,10 +44,12 @@ class WiFiNodeDriver:
 
         info["connection_state"] = "ok"
         info["raw_info"] = response
-        info.update(self._parse_info_response(response))
-        returned_uid = self._extract_uid(info)
+        parsed_info = self._parse_info_response(response)
+        returned_uid = self._extract_uid(parsed_info)
         if returned_uid:
             self._validate_uid(returned_uid)
+            parsed_info["node_uid"] = returned_uid
+        info.update(parsed_info)
         return info
 
     def get_capabilities(self) -> dict:
@@ -65,18 +67,14 @@ class WiFiNodeDriver:
         }
 
     def get_reading(self) -> dict:
-        header_raw = self._send_command("HEADER")
-        reading_raw = self._send_command("READ")
-        parsed = self._parse_csv_reading(header_raw, reading_raw)
-
-        returned_uid = self._extract_uid(parsed)
+        info = self.get_info()
+        returned_uid = info.get("node_uid")
         if returned_uid:
             self._validate_uid(returned_uid)
-        else:
-            info = self.get_info()
-            returned_uid = self._extract_uid(info)
-            if returned_uid:
-                self._validate_uid(returned_uid)
+
+        header_raw = self._send_command("HEADER")
+        reading_raw = self._send_command("READ")
+        parsed, record_version = self._parse_csv_reading(header_raw, reading_raw)
 
         panel_voltage_v = parsed.pop("panel_voltage_v", None)
 
@@ -88,9 +86,16 @@ class WiFiNodeDriver:
         if returned_uid:
             extended["node_uid"] = returned_uid
 
+        if record_version:
+            extended["record_version"] = record_version
+
         for key in ("voltage_ok", "wifi", "rssi_dbm"):
             if key in parsed:
                 extended[key] = parsed.pop(key)
+
+        for key in ("node_type", "node_model", "fw", "protocol", "sensors", "ip", "mac"):
+            if key in info:
+                extended[key] = info[key]
 
         for key, value in parsed.items():
             if key not in ("uid",):
@@ -153,25 +158,70 @@ class WiFiNodeDriver:
         logger.info("Wi-Fi node command succeeded: %s %s:%s", command, self.host, self.port)
         return response
 
-    def _parse_csv_reading(self, header_raw: str, reading_raw: str) -> dict:
-        header = self._parse_csv_line(header_raw, "HEADER")
-        reading = self._parse_csv_line(reading_raw, "READ")
+    def _parse_csv_reading(self, header_raw: str, reading_raw: str) -> tuple[dict, Optional[str]]:
+        header_tokens = self._parse_csv_line(header_raw, "HEADER")
+        read_tokens = self._parse_csv_line(reading_raw, "READ")
+
+        if header_tokens and header_tokens[0].strip() == "HDR":
+            header, record_version = self._parse_framed_header(header_tokens)
+            reading = self._parse_framed_read(read_tokens)
+        elif read_tokens and read_tokens[0].strip() == "DAT":
+            raise WiFiNodeDriverError("Unexpected HEADER prefix: expected HDR")
+        else:
+            header = [field.strip() for field in header_tokens]
+            reading = [field.strip() for field in read_tokens]
+            record_version = None
 
         if len(header) != len(reading):
             logger.warning(
-                "Malformed Wi-Fi node CSV: %s header fields, %s reading fields",
+                "Malformed Wi-Fi node CSV after framing: %s header fields, %s reading fields",
                 len(header),
                 len(reading),
             )
             raise WiFiNodeDriverError(
-                f"Malformed CSV from Wi-Fi node: HEADER has {len(header)} fields, READ has {len(reading)}"
+                "Malformed CSV from Wi-Fi node: "
+                f"HEADER has {len(header)} measurement fields, READ has {len(reading)} values"
             )
 
-        return {
-            key.strip(): self._convert_value(value.strip())
-            for key, value in zip(header, reading)
-            if key.strip()
-        }
+        return (
+            {
+                key.strip(): self._convert_value(value.strip())
+                for key, value in zip(header, reading)
+                if key.strip()
+            },
+            record_version,
+        )
+
+    def _parse_framed_header(self, tokens: list[str]) -> tuple[list[str], str]:
+        if not tokens or tokens[0].strip() != "HDR":
+            logger.warning("Unexpected Wi-Fi node HEADER prefix: %r", tokens[0] if tokens else None)
+            raise WiFiNodeDriverError("Unexpected HEADER prefix: expected HDR")
+
+        if len(tokens) < 2 or not tokens[1].strip():
+            logger.warning("Malformed Wi-Fi node HEADER missing version: %r", tokens)
+            raise WiFiNodeDriverError("Malformed HEADER from Wi-Fi node: missing record-format version")
+
+        columns = [field.strip() for field in tokens[2:]]
+        if not columns:
+            logger.warning("Malformed Wi-Fi node HEADER has no measurement columns: %r", tokens)
+            raise WiFiNodeDriverError("Malformed HEADER from Wi-Fi node: no measurement columns")
+        if any(not field for field in columns):
+            logger.warning("Malformed Wi-Fi node HEADER has empty measurement column: %r", tokens)
+            raise WiFiNodeDriverError("Malformed HEADER from Wi-Fi node: empty measurement column")
+
+        return columns, tokens[1].strip()
+
+    def _parse_framed_read(self, tokens: list[str]) -> list[str]:
+        if not tokens or tokens[0].strip() != "DAT":
+            logger.warning("Unexpected Wi-Fi node READ prefix: %r", tokens[0] if tokens else None)
+            raise WiFiNodeDriverError("Unexpected READ prefix: expected DAT")
+
+        values = [field.strip() for field in tokens[1:]]
+        if not values:
+            logger.warning("Malformed Wi-Fi node READ has no measurement values: %r", tokens)
+            raise WiFiNodeDriverError("Malformed READ from Wi-Fi node: no measurement values")
+
+        return values
 
     def _parse_csv_line(self, text: str, label: str) -> list[str]:
         if not text or not text.strip():
@@ -190,6 +240,10 @@ class WiFiNodeDriver:
         return rows[0]
 
     def _parse_info_response(self, response: str) -> dict:
+        if not response or not response.strip():
+            raise WiFiNodeDriverError("Empty INFO response from Wi-Fi node")
+
+        response = response.strip()
         try:
             parsed = json.loads(response)
         except json.JSONDecodeError:
@@ -200,6 +254,16 @@ class WiFiNodeDriver:
                 str(key): self._convert_value(value) if isinstance(value, str) else value
                 for key, value in parsed.items()
             }
+
+        if response.startswith("OK INFO"):
+            response = response.removeprefix("OK INFO").strip()
+            info = {}
+            for token in response.split():
+                if "=" not in token:
+                    continue
+                key, value = token.split("=", 1)
+                info[key.strip()] = self._convert_value(value.strip())
+            return info
 
         if "," in response and "=" not in response:
             try:

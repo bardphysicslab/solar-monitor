@@ -214,6 +214,69 @@
         font-size: 14px;
       }
 
+      .device-section {
+        margin-top: 28px;
+      }
+
+      .section-title {
+        margin: 0 0 14px;
+        font-size: 22px;
+      }
+
+      .wifi-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+        gap: 20px;
+      }
+
+      .wifi-card {
+        display: grid;
+        gap: 14px;
+      }
+
+      .wifi-card-header {
+        display: flex;
+        align-items: baseline;
+        justify-content: space-between;
+        gap: 16px;
+      }
+
+      .wifi-uid {
+        color: var(--muted);
+        font-size: 13px;
+        overflow-wrap: anywhere;
+      }
+
+      .wifi-status-online {
+        color: var(--accent-2);
+      }
+
+      .wifi-status-offline {
+        color: var(--danger);
+      }
+
+      .wifi-voltage {
+        font-size: 38px;
+        font-weight: 800;
+        line-height: 1.1;
+      }
+
+      .wifi-details {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 10px 16px;
+      }
+
+      .wifi-detail-label {
+        color: var(--muted);
+        font-size: 12px;
+      }
+
+      .wifi-detail-value {
+        margin-top: 2px;
+        overflow-wrap: anywhere;
+      }
+
       @media (max-width: 900px) {
         .grid {
           grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -290,37 +353,37 @@
       </div>
 
       <div class="grid">
-        <section class="card chart-panel" id="channel-card-0">
+        <section class="card chart-panel">
           <div class="chart-header">
-            <h2 class="chart-title" id="channel-title-0">Total radiation</h2>
-            <div class="reading"><span id="channel-value-0">—</span> <span id="channel-unit-0">W/m²</span></div>
+            <h2 class="chart-title">Total radiation</h2>
+            <div class="reading"><span id="total-value">—</span> W/m²</div>
           </div>
           <div class="chart-wrap">
-            <canvas id="channel-chart-0"></canvas>
+            <canvas id="total-chart"></canvas>
           </div>
         </section>
 
-        <section class="card chart-panel" id="channel-card-1">
+        <section class="card chart-panel">
           <div class="chart-header">
-            <h2 class="chart-title" id="channel-title-1">Diffuse radiation</h2>
-            <div class="reading"><span id="channel-value-1">—</span> <span id="channel-unit-1">W/m²</span></div>
+            <h2 class="chart-title">Diffuse radiation</h2>
+            <div class="reading"><span id="diffuse-value">—</span> W/m²</div>
           </div>
           <div class="chart-wrap">
-            <canvas id="channel-chart-1"></canvas>
+            <canvas id="diffuse-chart"></canvas>
           </div>
         </section>
 
-        <section class="card chart-panel" id="channel-card-2">
+        <section class="card chart-panel">
           <div class="chart-header">
-            <h2 class="chart-title" id="channel-title-2">Sunshine</h2>
-            <div class="reading"><span id="channel-value-2">—</span> <span id="channel-unit-2"></span></div>
+            <h2 class="chart-title">Sunshine</h2>
+            <div class="reading"><span id="sun-value">—</span></div>
           </div>
           <div class="chart-wrap">
-            <canvas id="channel-chart-2"></canvas>
+            <canvas id="sun-chart"></canvas>
           </div>
         </section>
 
-        <section class="card chart-panel time-card" id="spn1-time-card">
+        <section class="card chart-panel time-card">
           <div class="chart-header">
             <h2 class="chart-title">SPN1 Time</h2>
             <div class="reading" id="spn1-time-status">Unavailable</div>
@@ -336,24 +399,30 @@
           <div class="time-note">SPN1 time resets after power loss. Sync when stopped.</div>
         </section>
       </div>
+
+      <section class="device-section" aria-labelledby="bardbox-node-title">
+        <h2 class="section-title" id="bardbox-node-title">BardBox Wi-Fi Nodes</h2>
+        <div class="wifi-grid" id="wifi-node-list"></div>
+      </section>
     </div>
 
     <script>
       const pollIntervalMs = {{ poll_interval_ms }};
       const maxPoints = 100;
+      const totalValueEl = document.getElementById("total-value");
+      const diffuseValueEl = document.getElementById("diffuse-value");
       const runStatusEl = document.getElementById("run-status");
       const clockLocalEl = document.getElementById("clock-local");
       const clockUtcEl = document.getElementById("clock-utc");
-      const spn1TimeCardEl = document.getElementById("spn1-time-card");
       const spn1UnitTimeEl = document.getElementById("spn1-unit-time");
       const spn1TimeStatusEl = document.getElementById("spn1-time-status");
       const spn1TimeResultEl = document.getElementById("spn1-time-result");
       const spn1TimeMessageEl = document.getElementById("spn1-time-message");
       const spn1TimeSyncButton = document.getElementById("spn1-time-sync");
-      let lastTimestamp = null;
+      const sunValueEl = document.getElementById("sun-value");
+      const wifiNodeListEl = document.getElementById("wifi-node-list");
+      let lastSpn1Timestamp = null;
       let runActive = false;
-      let activeChannels = [];
-      let spn1ControlsAvailable = false;
 
       Chart.defaults.color = "#a7a7a7";
       Chart.defaults.borderColor = "rgba(255, 255, 255, 0.12)";
@@ -404,11 +473,51 @@
         });
       }
 
-      const channelCharts = [
-        makeChart("channel-chart-0", "Channel 1", "#58a6ff"),
-        makeChart("channel-chart-1", "Channel 2", "#52d273"),
-        makeChart("channel-chart-2", "Channel 3", "#f2cc60"),
-      ];
+      const totalChart = makeChart("total-chart", "Total radiation", "#58a6ff");
+      const diffuseChart = makeChart("diffuse-chart", "Diffuse radiation", "#52d273");
+      const sunChart = new Chart(document.getElementById("sun-chart"), {
+        type: "line",
+        data: {
+          labels: [],
+          datasets: [
+            {
+              label: "Sun",
+              data: [],
+              borderColor: "#f2cc60",
+              backgroundColor: "#f2cc60",
+              borderWidth: 2,
+              pointRadius: 0,
+              tension: 0,
+              stepped: true,
+            },
+          ],
+        },
+        options: {
+          animation: false,
+          maintainAspectRatio: false,
+          responsive: true,
+          scales: {
+            x: {
+              ticks: {
+                maxRotation: 0,
+                autoSkip: true,
+                maxTicksLimit: 8,
+              },
+            },
+            y: {
+              min: 0,
+              max: 1,
+              ticks: {
+                stepSize: 1,
+                callback: v => (v === 1 ? "Sun" : "No Sun"),
+              },
+            },
+          },
+          plugins: {
+            legend: { display: false },
+          },
+        },
+      });
 
 
       function formatTime(timestamp) {
@@ -429,65 +538,105 @@
         chart.update();
       }
 
-      function configureDriver(driver) {
-        const info = driver?.info || {};
-        const channels = driver?.capabilities?.channels || {};
-        const nextChannels = Object.entries(channels).slice(0, channelCharts.length).map(([key, meta]) => ({
-          key,
-          label: meta.label || key,
-          unit: meta.unit || "",
-        }));
-
-        const signature = JSON.stringify(nextChannels);
-        if (signature !== JSON.stringify(activeChannels)) {
-          activeChannels = nextChannels;
-          lastTimestamp = null;
-
-          channelCharts.forEach((chart, index) => {
-            const channel = activeChannels[index];
-            const card = document.getElementById(`channel-card-${index}`);
-            const title = document.getElementById(`channel-title-${index}`);
-            const value = document.getElementById(`channel-value-${index}`);
-            const unit = document.getElementById(`channel-unit-${index}`);
-            card.style.display = channel ? "" : "none";
-            if (!channel) return;
-            title.textContent = channel.label;
-            value.textContent = "—";
-            unit.textContent = channel.unit;
-            chart.data.labels = [];
-            chart.data.datasets[0].data = [];
-            chart.data.datasets[0].label = channel.label;
-            chart.options.scales.y.title.display = Boolean(channel.unit);
-            chart.options.scales.y.title.text = channel.unit;
-            chart.update();
-          });
-        }
-
-        spn1ControlsAvailable = info.protocol === "SPN1";
-        spn1TimeCardEl.style.display = spn1ControlsAvailable ? "" : "none";
-      }
-
-      function updateReading(reading) {
-        if (!reading || reading.timestamp === lastTimestamp) return;
-        lastTimestamp = reading.timestamp;
+      function updateSpn1Reading(reading) {
+        if (!reading || reading.timestamp === lastSpn1Timestamp) return;
+        lastSpn1Timestamp = reading.timestamp;
 
         const data = reading.data || {};
         const extended = reading.extended || {};
         const label = formatTime(reading.timestamp);
         if (reading.status !== "ok") return;
 
-        activeChannels.forEach((channel, index) => {
-          const value = data[channel.key];
-          if (typeof value !== "number") return;
-          document.getElementById(`channel-value-${index}`).textContent = Number.isInteger(value)
-            ? String(value)
-            : value.toFixed(2);
-          pushPoint(channelCharts[index], label, value);
-        });
+        totalValueEl.textContent = Number(data.total_w_m2).toFixed(1);
+        diffuseValueEl.textContent = Number(data.diffuse_w_m2).toFixed(1);
+        sunValueEl.textContent = data.sun === 1 ? "Sun" : "No sun";
+        pushPoint(totalChart, label, data.total_w_m2);
+        pushPoint(diffuseChart, label, data.diffuse_w_m2);
+        pushPoint(sunChart, label, data.sun);
+        updateSpn1TimeFromReading(reading, extended);
+      }
 
-        if (spn1ControlsAvailable) {
-          updateSpn1TimeFromReading(reading, extended);
+      function formatValue(value, suffix = "") {
+        if (value === null || value === undefined || value === "") return "—";
+        return `${value}${suffix}`;
+      }
+
+      function escapeHtml(value) {
+        return String(value).replace(/[&<>"']/g, (char) => ({
+          "&": "&amp;",
+          "<": "&lt;",
+          ">": "&gt;",
+          '"': "&quot;",
+          "'": "&#39;",
+        }[char]));
+      }
+
+      function formatVoltage(value) {
+        return typeof value === "number" ? `${value.toFixed(3)} V` : "—";
+      }
+
+      function renderWifiNodes(nodes) {
+        const cards = nodes || [];
+        if (!cards.length) {
+          wifiNodeListEl.innerHTML = '<section class="card chart-panel wifi-card"><div class="reading">No BardBox Wi-Fi nodes configured.</div></section>';
+          return;
         }
+
+        wifiNodeListEl.innerHTML = cards.map((node) => {
+          const info = node.info || {};
+          const reading = node.latest_reading || {};
+          const data = reading.data || {};
+          const extended = reading.extended || {};
+          const isOnline = reading.status === "ok";
+          const statusClass = isOnline ? "wifi-status-online" : "wifi-status-offline";
+          const statusText = isOnline ? "Online" : "Offline";
+          const error = reading.status === "error" ? extended.error : info.error;
+          const firmware = extended.fw || info.fw || info.firmware;
+          const rssi = extended.rssi_dbm ?? info.rssi_dbm;
+          const wifi = extended.wifi;
+          const timestamp = reading.timestamp ? new Date(reading.timestamp).toLocaleString() : "No reading yet";
+          const errorMarkup = error ? `<div class="time-message">${escapeHtml(error)}</div>` : "";
+
+          return `
+            <section class="card chart-panel wifi-card">
+              <div class="wifi-card-header">
+                <div>
+                  <h3 class="chart-title">BardBox Wi-Fi Node</h3>
+                  <div class="wifi-uid">${escapeHtml(info.uid || reading.uid || "Unknown UID")}</div>
+                </div>
+                <div class="${statusClass}">${escapeHtml(statusText)}</div>
+              </div>
+              <div class="wifi-voltage">${escapeHtml(formatVoltage(data.panel_voltage_v))}</div>
+              <div class="wifi-details">
+                <div>
+                  <div class="wifi-detail-label">Wi-Fi</div>
+                  <div class="wifi-detail-value">${escapeHtml(wifi === 1 ? "Connected" : wifi === 0 ? "Disconnected" : "—")}</div>
+                </div>
+                <div>
+                  <div class="wifi-detail-label">RSSI</div>
+                  <div class="wifi-detail-value">${escapeHtml(formatValue(rssi, " dBm"))}</div>
+                </div>
+                <div>
+                  <div class="wifi-detail-label">Firmware</div>
+                  <div class="wifi-detail-value">${escapeHtml(formatValue(firmware))}</div>
+                </div>
+                <div>
+                  <div class="wifi-detail-label">Timestamp</div>
+                  <div class="wifi-detail-value">${escapeHtml(timestamp)}</div>
+                </div>
+                <div>
+                  <div class="wifi-detail-label">IP</div>
+                  <div class="wifi-detail-value">${escapeHtml(formatValue(extended.ip || info.ip))}</div>
+                </div>
+                <div>
+                  <div class="wifi-detail-label">MAC</div>
+                  <div class="wifi-detail-value">${escapeHtml(formatValue(extended.mac || info.mac))}</div>
+                </div>
+              </div>
+              ${errorMarkup}
+            </section>
+          `;
+        }).join("");
       }
 
       async function setRunActive(active) {
@@ -499,18 +648,18 @@
         runStatusEl.textContent = runActive ? "Running" : "Stopped";
         runStatusEl.classList.toggle("status-running", runActive);
         runStatusEl.classList.toggle("status-stopped", !runActive);
-        spn1TimeSyncButton.disabled = runActive || !spn1ControlsAvailable;
+        spn1TimeSyncButton.disabled = runActive;
         spn1TimeSyncButton.title = runActive ? "Stop run before syncing SPN1 time." : "";
-        spn1TimeMessageEl.textContent = runActive && spn1ControlsAvailable ? "Stop the run before syncing SPN1 time." : "";
+        spn1TimeMessageEl.textContent = runActive ? "Stop the run before syncing SPN1 time." : "";
       }
 
       async function refreshState() {
         const response = await fetch("/state");
         const state = await response.json();
         runActive = Boolean(state.run_active);
-        configureDriver(state.driver);
         showRunState(runActive);
-        updateReading(state.latest_reading);
+        updateSpn1Reading(state.latest_spn1_reading);
+        renderWifiNodes(state.wifi_nodes);
       }
 
       async function refreshTime() {
@@ -550,7 +699,6 @@
       }
 
       async function refreshSpn1Time() {
-        if (!spn1ControlsAvailable) return;
         const response = await fetch("/spn1/time");
         const payload = await response.json();
         showDeviceTime(payload);

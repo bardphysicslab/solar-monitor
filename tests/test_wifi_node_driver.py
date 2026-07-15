@@ -5,6 +5,13 @@ from unittest.mock import patch
 from raspi.drivers.wifi_node_driver import WiFiNodeDriver, WiFiNodeDriverError
 
 
+INFO = (
+    "OK INFO uid=bb-solar-pnl-001 node_type=solar_panel "
+    "node_model=dummy_voltage_wifi fw=0.1.0 protocol=bardbox-node-v1 "
+    "sensors=DUMMY_VOLTAGE ip=192.168.50.147 mac=B4:3A:45:33:BD:90 rssi_dbm=-38\n"
+)
+
+
 class FakeConnection:
     def __init__(self, response: str):
         self._chunks = [response.encode("utf-8")]
@@ -38,11 +45,12 @@ class WiFiNodeDriverTest(unittest.TestCase):
             timeout_s=3,
         )
 
-    def test_valid_header_and_reading_parse(self):
+    def test_valid_framed_protocol_parse(self):
         driver = self.make_driver()
         responses = [
-            FakeConnection("uid,panel_voltage_v,voltage_ok,wifi,rssi_dbm,firmware,extra\n"),
-            FakeConnection("bb-solar-pnl-001,7.42,1,1,-61,v1.0,preserved\n"),
+            FakeConnection(INFO),
+            FakeConnection("HDR,v1,panel_voltage_v,voltage_ok,rssi_dbm\n"),
+            FakeConnection("DAT,9.497,1,-46\n"),
         ]
 
         with patch("raspi.drivers.wifi_node_driver.socket.create_connection", side_effect=responses):
@@ -50,47 +58,88 @@ class WiFiNodeDriverTest(unittest.TestCase):
 
         self.assertEqual(reading["uid"], "bb-solar-pnl-001")
         self.assertEqual(reading["status"], "ok")
-        self.assertEqual(reading["data"]["panel_voltage_v"], 7.42)
+        self.assertEqual(reading["data"]["panel_voltage_v"], 9.497)
         self.assertEqual(reading["extended"]["voltage_ok"], 1)
-        self.assertEqual(reading["extended"]["wifi"], 1)
-        self.assertEqual(reading["extended"]["rssi_dbm"], -61)
-        self.assertEqual(reading["extended"]["firmware"], "v1.0")
-        self.assertEqual(reading["extended"]["extra"], "preserved")
+        self.assertEqual(reading["extended"]["rssi_dbm"], -46)
+        self.assertEqual(reading["extended"]["record_version"], "v1")
+        self.assertEqual(reading["extended"]["node_uid"], "bb-solar-pnl-001")
+        self.assertEqual(reading["extended"]["fw"], "0.1.0")
+        self.assertEqual(reading["extended"]["protocol"], "bardbox-node-v1")
+        self.assertEqual(reading["extended"]["ip"], "192.168.50.147")
+        self.assertEqual(reading["extended"]["mac"], "B4:3A:45:33:BD:90")
+        self.assertEqual(reading["extended"]["sensors"], "DUMMY_VOLTAGE")
 
-    def test_mismatched_field_counts_raise_useful_error(self):
+    def test_bad_header_prefix(self):
         driver = self.make_driver()
-        responses = [
-            FakeConnection("uid,panel_voltage_v,voltage_ok\n"),
-            FakeConnection("bb-solar-pnl-001,7.42\n"),
-        ]
 
-        with patch("raspi.drivers.wifi_node_driver.socket.create_connection", side_effect=responses):
-            with self.assertRaisesRegex(WiFiNodeDriverError, "Malformed CSV"):
-                driver.get_reading()
+        with self.assertRaisesRegex(WiFiNodeDriverError, "Unexpected HEADER prefix"):
+            driver._parse_csv_reading(
+                "HEAD,v1,panel_voltage_v,voltage_ok,rssi_dbm",
+                "DAT,9.497,1,-46",
+            )
 
-    def test_numeric_conversion(self):
+    def test_bad_read_prefix(self):
         driver = self.make_driver()
-        parsed = driver._parse_csv_reading(
-            "uid,panel_voltage_v,voltage_ok,wifi,rssi_dbm,count,label",
-            "bb-solar-pnl-001,0.25,1,0,-70,12,node-a",
-        )
 
-        self.assertIsInstance(parsed["panel_voltage_v"], float)
-        self.assertEqual(parsed["panel_voltage_v"], 0.25)
-        self.assertIsInstance(parsed["voltage_ok"], int)
-        self.assertEqual(parsed["count"], 12)
-        self.assertEqual(parsed["label"], "node-a")
+        with self.assertRaisesRegex(WiFiNodeDriverError, "Unexpected READ prefix"):
+            driver._parse_csv_reading(
+                "HDR,v1,panel_voltage_v,voltage_ok,rssi_dbm",
+                "DATA,9.497,1,-46",
+            )
+
+    def test_missing_header_version(self):
+        driver = self.make_driver()
+
+        with self.assertRaisesRegex(WiFiNodeDriverError, "missing record-format version"):
+            driver._parse_csv_reading(
+                "HDR,,panel_voltage_v,voltage_ok,rssi_dbm",
+                "DAT,9.497,1,-46",
+            )
+
+    def test_zero_measurement_columns(self):
+        driver = self.make_driver()
+
+        with self.assertRaisesRegex(WiFiNodeDriverError, "no measurement columns"):
+            driver._parse_csv_reading("HDR,v1", "DAT,9.497")
+
+    def test_mismatched_post_framing_field_counts(self):
+        driver = self.make_driver()
+
+        with self.assertRaisesRegex(WiFiNodeDriverError, "HEADER has 3 measurement fields, READ has 2 values"):
+            driver._parse_csv_reading(
+                "HDR,v1,panel_voltage_v,voltage_ok,rssi_dbm",
+                "DAT,9.497,1",
+            )
+
+    def test_empty_response(self):
+        driver = self.make_driver()
+
+        with self.assertRaisesRegex(WiFiNodeDriverError, "Empty HEADER response"):
+            driver._parse_csv_reading("", "DAT,9.497,1,-46")
 
     def test_uid_mismatch_raises_clear_error(self):
         driver = self.make_driver()
         responses = [
-            FakeConnection("uid,panel_voltage_v\n"),
-            FakeConnection("other-node,7.42\n"),
+            FakeConnection(INFO.replace("bb-solar-pnl-001", "other-node")),
         ]
 
         with patch("raspi.drivers.wifi_node_driver.socket.create_connection", side_effect=responses):
             with self.assertRaisesRegex(WiFiNodeDriverError, "UID mismatch"):
-                driver.get_reading()
+                driver.get_info()
+
+    def test_valid_ok_info_key_value_parsing(self):
+        driver = self.make_driver()
+        parsed = driver._parse_info_response(INFO)
+
+        self.assertEqual(parsed["uid"], "bb-solar-pnl-001")
+        self.assertEqual(parsed["node_type"], "solar_panel")
+        self.assertEqual(parsed["node_model"], "dummy_voltage_wifi")
+        self.assertEqual(parsed["fw"], "0.1.0")
+        self.assertEqual(parsed["protocol"], "bardbox-node-v1")
+        self.assertEqual(parsed["sensors"], "DUMMY_VOLTAGE")
+        self.assertEqual(parsed["ip"], "192.168.50.147")
+        self.assertEqual(parsed["mac"], "B4:3A:45:33:BD:90")
+        self.assertEqual(parsed["rssi_dbm"], -38)
 
     def test_connection_timeout_raises_clear_error(self):
         driver = self.make_driver()
