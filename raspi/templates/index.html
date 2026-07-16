@@ -225,26 +225,38 @@
 
       .wifi-grid {
         display: grid;
-        grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+        grid-template-columns: repeat(auto-fit, minmax(min(100%, 260px), 1fr));
         gap: 20px;
       }
 
       .wifi-card {
         display: grid;
-        gap: 14px;
+        min-height: 260px;
+        align-content: start;
+        gap: 16px;
       }
 
       .wifi-card-header {
         display: flex;
-        align-items: baseline;
+        align-items: center;
         justify-content: space-between;
-        gap: 16px;
+        gap: 12px;
       }
 
       .wifi-uid {
         color: var(--muted);
         font-size: 13px;
+        font-weight: 700;
         overflow-wrap: anywhere;
+      }
+
+      .wifi-badge {
+        border: 1px solid currentColor;
+        border-radius: 999px;
+        padding: 4px 9px;
+        font-size: 11px;
+        font-weight: 800;
+        letter-spacing: 0.08em;
       }
 
       .wifi-status-online {
@@ -256,15 +268,30 @@
       }
 
       .wifi-voltage {
-        font-size: 38px;
+        display: grid;
+        justify-items: center;
+        gap: 4px;
+        padding: 10px 0;
+      }
+
+      .wifi-voltage-value {
+        font-size: clamp(34px, 4vw, 46px);
         font-weight: 800;
         line-height: 1.1;
+      }
+
+      .wifi-voltage-label {
+        color: var(--muted);
+        font-size: 12px;
+        font-weight: 700;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
       }
 
       .wifi-details {
         display: grid;
         grid-template-columns: repeat(2, minmax(0, 1fr));
-        gap: 10px 16px;
+        gap: 12px 16px;
       }
 
       .wifi-detail-label {
@@ -275,6 +302,24 @@
       .wifi-detail-value {
         margin-top: 2px;
         overflow-wrap: anywhere;
+      }
+
+      @media (min-width: 1180px) {
+        .wifi-grid {
+          grid-template-columns: repeat(4, minmax(0, 1fr));
+        }
+      }
+
+      @media (max-width: 1179px) and (min-width: 900px) {
+        .wifi-grid {
+          grid-template-columns: repeat(3, minmax(0, 1fr));
+        }
+      }
+
+      @media (max-width: 899px) and (min-width: 560px) {
+        .wifi-grid {
+          grid-template-columns: repeat(2, minmax(0, 1fr));
+        }
       }
 
       @media (max-width: 900px) {
@@ -599,32 +644,27 @@
           const extended = reading.extended || {};
           const isOnline = reading.status === "ok";
           const statusClass = isOnline ? "wifi-status-online" : "wifi-status-offline";
-          const statusText = isOnline ? "ONLINE" : "OFFLINE";
+          const statusText = isOnline ? "LIVE" : "OFFLINE";
           const error = reading.status === "error" ? extended.error : null;
           const firmware = extended.fw || extended.firmware;
           const rssi = extended.rssi_dbm;
+          const nodeModel = extended.node_model;
+          const ipAddress = extended.ip;
           const timestamp = reading.timestamp ? new Date(reading.timestamp).toLocaleString() : "No reading yet";
           const errorMarkup = error ? `<div class="time-message">${escapeHtml(error)}</div>` : "";
 
           return `
             <section class="card chart-panel wifi-card">
               <div class="wifi-card-header">
-                <div>
-                  <h3 class="chart-title">Solar Panel Node</h3>
-                  <div class="wifi-uid">${escapeHtml(reading.uid || "Unknown UID")}</div>
-                </div>
-                <div class="${statusClass}">${escapeHtml(statusText)}</div>
+                <div class="wifi-uid">${escapeHtml(reading.uid || "Unknown UID")}</div>
+                <div class="wifi-badge ${statusClass}">${escapeHtml(statusText)}</div>
               </div>
-              <div class="wifi-voltage">${escapeHtml(formatVoltage(data.panel_voltage_v))}</div>
+              <h3 class="chart-title">Solar Panel Node</h3>
+              <div class="wifi-voltage">
+                <div class="wifi-voltage-value">${escapeHtml(formatVoltage(data.panel_voltage_v))}</div>
+                <div class="wifi-voltage-label">Panel Voltage</div>
+              </div>
               <div class="wifi-details">
-                <div>
-                  <div class="wifi-detail-label">UID</div>
-                  <div class="wifi-detail-value">${escapeHtml(reading.uid || "—")}</div>
-                </div>
-                <div>
-                  <div class="wifi-detail-label">Panel Voltage</div>
-                  <div class="wifi-detail-value">${escapeHtml(formatVoltage(data.panel_voltage_v))}</div>
-                </div>
                 <div>
                   <div class="wifi-detail-label">Voltage OK</div>
                   <div class="wifi-detail-value">${escapeHtml(formatVoltageOk(extended.voltage_ok))}</div>
@@ -638,12 +678,16 @@
                   <div class="wifi-detail-value">${escapeHtml(formatValue(firmware))}</div>
                 </div>
                 <div>
-                  <div class="wifi-detail-label">Timestamp</div>
+                  <div class="wifi-detail-label">Updated</div>
                   <div class="wifi-detail-value">${escapeHtml(timestamp)}</div>
                 </div>
                 <div>
-                  <div class="wifi-detail-label">Online/Offline</div>
-                  <div class="wifi-detail-value ${statusClass}">${escapeHtml(statusText)}</div>
+                  <div class="wifi-detail-label">Node Model</div>
+                  <div class="wifi-detail-value">${escapeHtml(formatValue(nodeModel))}</div>
+                </div>
+                <div>
+                  <div class="wifi-detail-label">IP Address</div>
+                  <div class="wifi-detail-value">${escapeHtml(formatValue(ipAddress))}</div>
                 </div>
               </div>
               ${errorMarkup}
@@ -667,16 +711,17 @@
       }
 
       async function refreshState() {
-        const [stateResponse, readingsResponse] = await Promise.all([
-          fetch("/state"),
-          fetch("/readings/latest"),
-        ]);
+        const stateResponse = await fetch("/state");
         const state = await stateResponse.json();
-        const latest = await readingsResponse.json();
         runActive = Boolean(state.run_active);
         showRunState(runActive);
         updateSpn1Reading(state.latest_spn1_reading);
-        renderWifiNodes(latest.readings);
+      }
+
+      async function refreshWifiNodes() {
+        const response = await fetch("/readings/latest");
+        const payload = await response.json();
+        renderWifiNodes(Array.isArray(payload.readings) ? payload.readings : []);
       }
 
       async function refreshTime() {
@@ -750,8 +795,14 @@
       });
 
       refreshState().catch(console.error);
+      refreshWifiNodes().catch(console.error);
+
       setInterval(() => {
         refreshState().catch(console.error);
+      }, pollIntervalMs);
+
+      setInterval(() => {
+        refreshWifiNodes().catch(console.error);
       }, pollIntervalMs);
 
       refreshTime().catch(console.error);

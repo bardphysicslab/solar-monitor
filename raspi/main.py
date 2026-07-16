@@ -274,16 +274,12 @@ def get_latest_readings():
 
 @app.get("/state")
 def get_state():
-    drivers_payload = [driver_payload(driver) for driver in DRIVERS]
     return JSONResponse(
         {
             "run_active": is_run_active(),
             "latest_reading": latest_primary_reading(),
             "latest_spn1_reading": latest_spn1_reading(),
             "latest_readings": latest_readings(),
-            "driver": drivers_payload[0] if drivers_payload else None,
-            "drivers": drivers_payload,
-            "wifi_nodes": wifi_node_cards(),
         }
     )
 
