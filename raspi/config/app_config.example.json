@@ -18,7 +18,9 @@
       "uid": "spn1-0001",
       "config": {
         "port": "/dev/cu.PL2303G-USBtoUART1130",
-        "baud": 9600
+        "baud": 9600,
+        "auto_sync_time": true,
+        "sync_interval_hours": 24
       }
     }
   ]

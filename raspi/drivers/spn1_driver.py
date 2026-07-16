@@ -11,10 +11,19 @@ except ImportError:
 
 
 class SPN1Driver:
-    def __init__(self, uid: str, port: str, baud: int):
+    def __init__(
+        self,
+        uid: str,
+        port: str,
+        baud: int,
+        auto_sync_time: bool = True,
+        sync_interval_hours: float = 24,
+    ):
         self.uid = uid
         self.port = port
         self.baud = baud
+        self.auto_sync_time = auto_sync_time
+        self.sync_interval_hours = sync_interval_hours
         self._instrument = None
         self._lock = threading.RLock()
 
@@ -27,6 +36,8 @@ class SPN1Driver:
             "firmware": None,
             "port": self.port,
             "baud": self.baud,
+            "auto_sync_time": self.auto_sync_time,
+            "sync_interval_hours": self.sync_interval_hours,
         }
 
     def get_capabilities(self) -> dict:
@@ -112,11 +123,21 @@ class SPN1Driver:
             "error": None if parsed else "Could not parse SPN1 time",
         }
 
-    def sync_device_time(self, dt_local: datetime) -> dict:
-        before = self.get_device_time()
+    def sync_device_time(self, dt_utc: datetime) -> dict:
+        """
+        Sync the SPN1 clock using UTC from the Raspberry Pi system clock.
 
-        date_command = f"Y{dt_local:%Y/%m/%d}"
-        time_command = f"H{dt_local:%H:%M:%S}"
+        The SPN1 protocol accepts date/time fields without timezone metadata, so
+        this driver writes the UTC date and UTC time as plain SPN1 values.
+        """
+        if dt_utc.tzinfo is None:
+            dt_utc = dt_utc.replace(tzinfo=timezone.utc)
+        else:
+            dt_utc = dt_utc.astimezone(timezone.utc)
+
+        dt_utc_naive = dt_utc.replace(tzinfo=None)
+        date_command = f"Y{dt_utc:%Y/%m/%d}"
+        time_command = f"H{dt_utc:%H:%M:%S}"
 
         test_response = ""
         date_response = ""
@@ -125,8 +146,10 @@ class SPN1Driver:
         verify_response = ""
         step = "start"
 
-        try:
-            with self._lock:
+        with self._lock:
+            before = self.get_device_time()
+
+            try:
                 instrument = self._open(read_timeout_s=0.05)
                 self._reset_input(instrument)
 
@@ -169,21 +192,22 @@ class SPN1Driver:
                 time.sleep(0.25)
                 verify_response = self._send_command("Z", response_delay_s=0.3, read_window_s=1.0)
 
-        except Exception as exc:
-            self._close()
-            return {
-                "status": "error",
-                "timestamp": self._utc_timestamp(),
-                "before": before,
-                "after": None,
-                "step": step,
-                "response_T": self._bound_debug(test_response),
-                "response_Y": self._bound_debug(date_response),
-                "response_H": self._bound_debug(time_response),
-                "response_R": self._bound_debug(run_response),
-                "response_Z": self._bound_debug(verify_response),
-                "error": str(exc),
-            }
+            except Exception as exc:
+                self._close()
+                return {
+                    "status": "error",
+                    "timestamp": self._utc_timestamp(),
+                    "time_basis": "UTC",
+                    "before": before,
+                    "after": None,
+                    "step": step,
+                    "response_T": self._bound_debug(test_response),
+                    "response_Y": self._bound_debug(date_response),
+                    "response_H": self._bound_debug(time_response),
+                    "response_R": self._bound_debug(run_response),
+                    "response_Z": self._bound_debug(verify_response),
+                    "error": str(exc),
+                }
 
         parsed_after = self._parse_spn1_datetime(verify_response)
 
@@ -191,12 +215,14 @@ class SPN1Driver:
             "status": "ok" if parsed_after else "error",
             "timestamp": self._utc_timestamp(),
             "device_time_local": self._format_device_time(parsed_after) if parsed_after else None,
+            "device_time_utc": self._format_device_time(parsed_after) if parsed_after else None,
+            "time_basis": "UTC",
             "parsed": parsed_after is not None,
             "raw": verify_response,
         }
 
         delta_seconds = (
-            abs((parsed_after - dt_local.replace(tzinfo=None)).total_seconds())
+            abs((parsed_after - dt_utc_naive).total_seconds())
             if parsed_after
             else None
         )
@@ -206,6 +232,7 @@ class SPN1Driver:
         return {
             "status": "ok" if verified else "error",
             "timestamp": self._utc_timestamp(),
+            "time_basis": "UTC",
             "before": before,
             "after": after,
             "delta_seconds": delta_seconds,

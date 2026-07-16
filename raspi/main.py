@@ -3,7 +3,7 @@ import logging
 import os
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -29,6 +29,14 @@ templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
 run_active = False
 latest_readings_by_uid: Dict[str, Dict[str, Any]] = {}
 state_lock = threading.Lock()
+sync_status_lock = threading.Lock()
+spn1_sync_status: Dict[str, Any] = {
+    "auto_sync_enabled": False,
+    "sync_interval_hours": 24,
+    "last_sync_attempt_utc": None,
+    "last_sync_success_utc": None,
+    "last_sync_error": None,
+}
 
 
 def utc_now() -> datetime:
@@ -48,6 +56,20 @@ def load_config() -> Dict[str, Any]:
 APP_CONFIG = load_config()
 
 
+def parse_spn1_sync_interval_hours(value: Any, uid: str) -> float:
+    try:
+        interval = float(value)
+    except (TypeError, ValueError):
+        logger.warning("Invalid SPN1 sync_interval_hours for %s; falling back to 24 hours", uid)
+        return 24
+
+    if interval <= 0:
+        logger.warning("Invalid SPN1 sync_interval_hours for %s; falling back to 24 hours", uid)
+        return 24
+
+    return interval
+
+
 def load_drivers(config: Dict[str, Any]) -> List[Any]:
     loaded = []
     for entry in config.get("drivers", []):
@@ -56,11 +78,17 @@ def load_drivers(config: Dict[str, Any]) -> List[Any]:
         driver_config = entry.get("config", {})
 
         if driver_name == "spn1":
+            sync_interval_hours = parse_spn1_sync_interval_hours(
+                driver_config.get("sync_interval_hours", 24),
+                uid,
+            )
             loaded.append(
                 SPN1Driver(
                     uid=uid,
                     port=driver_config.get("port", "/dev/cu.PL2303G-USBtoUART130"),
                     baud=int(driver_config.get("baud", 9600)),
+                    auto_sync_time=bool(driver_config.get("auto_sync_time", True)),
+                    sync_interval_hours=sync_interval_hours,
                 )
             )
         elif driver_name == "wifi_node":
@@ -85,6 +113,13 @@ DRIVERS = load_drivers(APP_CONFIG)
 PRIMARY_DRIVER = DRIVERS[0] if DRIVERS else None
 
 
+def get_configured_spn1_driver() -> Optional[SPN1Driver]:
+    for driver in DRIVERS:
+        if isinstance(driver, SPN1Driver):
+            return driver
+    return None
+
+
 def time_status() -> Dict[str, Any]:
     return {
         "valid": True,
@@ -92,6 +127,132 @@ def time_status() -> Dict[str, Any]:
         "sane": True,
         "ntp_synced": False,
     }
+
+
+def iso_utc(value: datetime) -> str:
+    return value.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def configure_initial_spn1_sync_status() -> None:
+    driver = get_configured_spn1_driver()
+    with sync_status_lock:
+        if driver is None:
+            spn1_sync_status.update(
+                {
+                    "auto_sync_enabled": False,
+                    "sync_interval_hours": 24,
+                    "last_sync_attempt_utc": None,
+                    "last_sync_success_utc": None,
+                    "last_sync_error": "SPN1 driver not configured",
+                }
+            )
+            return
+
+        spn1_sync_status.update(
+            {
+                "auto_sync_enabled": bool(driver.auto_sync_time),
+                "sync_interval_hours": driver.sync_interval_hours,
+                "last_sync_attempt_utc": None,
+                "last_sync_success_utc": None,
+                "last_sync_error": None,
+            }
+        )
+
+
+def get_spn1_sync_status() -> Dict[str, Any]:
+    with sync_status_lock:
+        return dict(spn1_sync_status)
+
+
+def update_spn1_sync_status(**updates: Any) -> None:
+    with sync_status_lock:
+        spn1_sync_status.update(updates)
+
+
+def should_sync_spn1_time(now_utc: datetime, driver: SPN1Driver) -> bool:
+    status = get_spn1_sync_status()
+    last_attempt = status.get("last_sync_attempt_utc")
+    if not last_attempt:
+        return True
+
+    try:
+        last_attempt_dt = datetime.strptime(last_attempt, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return True
+
+    return now_utc - last_attempt_dt >= timedelta(hours=driver.sync_interval_hours)
+
+
+def sync_spn1_time_once(reason: str = "manual") -> Dict[str, Any]:
+    driver = get_configured_spn1_driver()
+    if driver is None:
+        error = "SPN1 driver not configured"
+        update_spn1_sync_status(last_sync_error=error)
+        return {"status": "skipped", "error": error}
+
+    update_spn1_sync_status(
+        auto_sync_enabled=bool(driver.auto_sync_time),
+        sync_interval_hours=driver.sync_interval_hours,
+    )
+
+    if not driver.auto_sync_time and reason != "manual":
+        logger.info("SPN1 automatic UTC time sync is disabled")
+        return {"status": "skipped", "error": None}
+
+    now_utc = utc_now()
+    update_spn1_sync_status(last_sync_attempt_utc=iso_utc(now_utc))
+    logger.info("Attempting SPN1 UTC time sync (%s)", reason)
+
+    try:
+        result = driver.sync_device_time(now_utc)
+    except Exception as exc:
+        error = str(exc)
+        logger.warning("SPN1 UTC time sync failed (%s): %s", reason, error)
+        update_spn1_sync_status(last_sync_error=error)
+        return {"status": "error", "error": error}
+
+    if result.get("status") == "ok":
+        update_spn1_sync_status(
+            last_sync_success_utc=iso_utc(utc_now()),
+            last_sync_error=None,
+        )
+        logger.info("SPN1 UTC time sync succeeded (%s)", reason)
+    else:
+        error = result.get("error") or "SPN1 time sync failed"
+        update_spn1_sync_status(last_sync_error=error)
+        logger.warning("SPN1 UTC time sync failed (%s): %s", reason, error)
+
+    return result
+
+
+def spn1_time_sync_loop() -> None:
+    driver = get_configured_spn1_driver()
+    if driver is None:
+        configure_initial_spn1_sync_status()
+        return
+
+    configure_initial_spn1_sync_status()
+
+    if driver.auto_sync_time:
+        sync_spn1_time_once(reason="startup")
+
+    while True:
+        time.sleep(60)
+        driver = get_configured_spn1_driver()
+        if driver is None:
+            configure_initial_spn1_sync_status()
+            continue
+        if not driver.auto_sync_time:
+            update_spn1_sync_status(auto_sync_enabled=False)
+            continue
+
+        now_utc = utc_now()
+        if should_sync_spn1_time(now_utc, driver):
+            logger.info("Periodic SPN1 UTC time sync due")
+            sync_spn1_time_once(reason="periodic")
+
+
+configure_initial_spn1_sync_status()
 
 
 def set_latest_reading(uid: str, reading: Dict[str, Any]) -> None:
@@ -202,8 +363,11 @@ def get_spn1_driver() -> SPN1Driver:
 
 @app.on_event("startup")
 def start_background_reader() -> None:
-    thread = threading.Thread(target=polling_loop, daemon=True)
-    thread.start()
+    polling_thread = threading.Thread(target=polling_loop, daemon=True)
+    polling_thread.start()
+
+    sync_thread = threading.Thread(target=spn1_time_sync_loop, daemon=True)
+    sync_thread.start()
 
 
 @app.get("/")
@@ -256,6 +420,7 @@ def get_app_health():
             "time_status": time_status(),
             "driver_count": len(DRIVERS),
             "run_active": is_run_active(),
+            "spn1_time_sync": get_spn1_sync_status(),
         }
     )
 
@@ -281,6 +446,7 @@ def get_state():
             "latest_reading": latest_primary_reading(),
             "latest_spn1_reading": latest_spn1_reading(),
             "latest_readings": latest_readings(),
+            "spn1_time_sync": get_spn1_sync_status(),
         }
     )
 
@@ -299,11 +465,8 @@ def get_spn1_time():
 
 @app.post("/spn1/time/sync")
 def sync_spn1_time():
-    if is_run_active():
-        raise HTTPException(status_code=409, detail="Stop run before syncing SPN1 time.")
-
-    driver = get_spn1_driver()
-    return JSONResponse(driver.sync_device_time(local_now()))
+    get_spn1_driver()
+    return JSONResponse(sync_spn1_time_once(reason="manual"))
 
 
 @app.post("/start")

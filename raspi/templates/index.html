@@ -467,22 +467,6 @@
             <canvas id="sun-chart"></canvas>
           </div>
         </section>
-
-        <section class="card chart-panel time-card">
-          <div class="chart-header">
-            <h2 class="chart-title">SPN1 Time</h2>
-            <div class="reading" id="spn1-time-status">Unavailable</div>
-          </div>
-          <div class="time-body">
-            <div class="unit-time" id="spn1-unit-time">Unavailable</div>
-            <div class="unit-time-status" id="spn1-time-result">Waiting for SPN1 time</div>
-          </div>
-          <div class="time-actions">
-            <button type="button" id="spn1-time-sync" title="Stop run before syncing SPN1 time.">Sync to Server Time</button>
-            <span class="time-message" id="spn1-time-message">Stop the run before syncing SPN1 time.</span>
-          </div>
-          <div class="time-note">SPN1 time resets after power loss. Sync when stopped.</div>
-        </section>
       </div>
 
       <section class="device-section" aria-labelledby="bardbox-node-title">
@@ -500,13 +484,15 @@
       const runStatusEl = document.getElementById("run-status");
       const clockLocalEl = document.getElementById("clock-local");
       const clockUtcEl = document.getElementById("clock-utc");
-      const spn1UnitTimeEl = document.getElementById("spn1-unit-time");
-      const spn1TimeStatusEl = document.getElementById("spn1-time-status");
-      const spn1TimeResultEl = document.getElementById("spn1-time-result");
-      const spn1TimeMessageEl = document.getElementById("spn1-time-message");
-      const spn1TimeSyncButton = document.getElementById("spn1-time-sync");
       const sunValueEl = document.getElementById("sun-value");
       const wifiNodeListEl = document.getElementById("wifi-node-list");
+      const expectedSolarNodeUids = [
+        "bb-solar-pnl-001",
+        "bb-solar-pnl-002",
+        "bb-solar-pnl-003",
+        "bb-solar-pnl-004",
+      ];
+      const openSolarDetails = new Set();
       let lastSpn1Timestamp = null;
       let runActive = false;
 
@@ -639,7 +625,6 @@
         pushPoint(totalChart, label, data.total_w_m2);
         pushPoint(diffuseChart, label, data.diffuse_w_m2);
         pushPoint(sunChart, label, data.sun);
-        updateSpn1TimeFromReading(reading, extended);
       }
 
       function formatValue(value, suffix = "") {
@@ -685,9 +670,15 @@
       function mergeSolarNodes(readings) {
         const nodesByUid = new Map();
 
+        expectedSolarNodeUids.forEach((uid) => {
+          nodesByUid.set(uid, { configured: { uid }, reading: null });
+        });
+
         (configuredSolarNodes || []).forEach((node) => {
           if (!node.uid) return;
-          nodesByUid.set(node.uid, { configured: node, reading: null });
+          const existing = nodesByUid.get(node.uid) || { configured: {}, reading: null };
+          existing.configured = { ...existing.configured, ...node };
+          nodesByUid.set(node.uid, existing);
         });
 
         (readings || []).filter(isSolarNodeReading).forEach((reading) => {
@@ -728,7 +719,38 @@
         `;
       }
 
+      function detailKey(uid, section) {
+        return `${uid}:${section}`;
+      }
+
+      function captureSolarDetailOpenState() {
+        wifiNodeListEl.querySelectorAll("details[data-detail-key]").forEach((detail) => {
+          const key = detail.dataset.detailKey;
+          if (!key) return;
+          if (detail.open) {
+            openSolarDetails.add(key);
+          } else {
+            openSolarDetails.delete(key);
+          }
+        });
+      }
+
+      function restoreSolarDetailOpenState() {
+        wifiNodeListEl.querySelectorAll("details[data-detail-key]").forEach((detail) => {
+          const key = detail.dataset.detailKey;
+          detail.open = openSolarDetails.has(key);
+          detail.addEventListener("toggle", () => {
+            if (detail.open) {
+              openSolarDetails.add(key);
+            } else {
+              openSolarDetails.delete(key);
+            }
+          });
+        });
+      }
+
       function renderWifiNodes(readings) {
+        captureSolarDetailOpenState();
         const cards = mergeSolarNodes(readings);
         if (!cards.length) {
           wifiNodeListEl.innerHTML = '<section class="card chart-panel wifi-card"><div class="reading">No BardBox solar node readings yet.</div></section>';
@@ -756,16 +778,8 @@
                 <div class="wifi-uid">${escapeHtml(uid)}</div>
                 <div class="wifi-badge ${statusClass}">${escapeHtml(state)}</div>
               </div>
-              <div class="panel-voltage-list">
-                ${panelVoltages.map((value, index) => `
-                  <div class="panel-voltage-row">
-                    <div class="panel-voltage-label">Panel ${index + 1}</div>
-                    <div class="panel-voltage-value">${escapeHtml(formatVoltage(value))}</div>
-                  </div>
-                `).join("")}
-              </div>
               <div class="wifi-details">
-                <details>
+                <details data-detail-key="${escapeHtml(detailKey(uid, "identity"))}">
                   <summary>Identity</summary>
                   <div class="wifi-detail-grid">
                     ${detailRow("Node type", extended.node_type)}
@@ -776,7 +790,7 @@
                     ${detailRow("MAC address", extended.mac)}
                   </div>
                 </details>
-                <details>
+                <details data-detail-key="${escapeHtml(detailKey(uid, "health"))}">
                   <summary>Health</summary>
                   <div class="wifi-detail-grid">
                     ${detailRow("Voltage OK", formatVoltageOk(extended.voltage_ok))}
@@ -786,7 +800,7 @@
                     ${error ? detailRow("Error", error) : ""}
                   </div>
                 </details>
-                <details>
+                <details data-detail-key="${escapeHtml(detailKey(uid, "hardware"))}">
                   <summary>Hardware</summary>
                   <div class="wifi-detail-grid">
                     ${detailRow("Sensor count", extended.sensor_count)}
@@ -794,11 +808,23 @@
                     ${detailRow("Sensors", extended.sensors)}
                   </div>
                 </details>
+                <details data-detail-key="${escapeHtml(detailKey(uid, "panel-readings"))}">
+                  <summary>Panel Readings</summary>
+                  <div class="panel-voltage-list">
+                    ${panelVoltages.map((value, index) => `
+                      <div class="panel-voltage-row">
+                        <div class="panel-voltage-label">Panel ${index + 1}</div>
+                        <div class="panel-voltage-value">${escapeHtml(formatVoltage(value))}</div>
+                      </div>
+                    `).join("")}
+                  </div>
+                </details>
               </div>
               ${errorMarkup}
             </section>
           `;
         }).join("");
+        restoreSolarDetailOpenState();
       }
 
       async function setRunActive(active) {
@@ -811,9 +837,6 @@
         runStatusEl.textContent = runActive ? "Running" : "Stopped";
         runStatusEl.classList.toggle("status-running", runActive);
         runStatusEl.classList.toggle("status-stopped", !runActive);
-        spn1TimeSyncButton.disabled = runActive;
-        spn1TimeSyncButton.title = runActive ? "Stop run before syncing SPN1 time." : "";
-        spn1TimeMessageEl.textContent = runActive ? "Stop the run before syncing SPN1 time." : "";
       }
 
       async function refreshState() {
@@ -837,67 +860,12 @@
         clockUtcEl.textContent = `UTC ${time.utc || "--"}`;
       }
 
-      function updateSpn1TimeFromReading(reading, extended) {
-        const spn1Time = extended.spn1_time_local || extended.spn1_time || null;
-        if (spn1Time) {
-          spn1UnitTimeEl.textContent = spn1Time;
-          spn1TimeStatusEl.textContent = "Available";
-          spn1TimeResultEl.textContent = "Updated with latest reading";
-          return;
-        }
-
-        if (reading.timestamp) {
-          spn1UnitTimeEl.textContent = new Date(reading.timestamp).toLocaleString();
-          spn1TimeStatusEl.textContent = "Server timestamp";
-          spn1TimeResultEl.textContent = "No SPN1 timestamp in latest reading";
-          return;
-        }
-
-        spn1UnitTimeEl.textContent = "Unavailable";
-        spn1TimeStatusEl.textContent = "Unavailable";
-        spn1TimeResultEl.textContent = "Unavailable";
-      }
-
-      function showDeviceTime(payload) {
-        const parsed = Boolean(payload && payload.parsed);
-        const unitTime = parsed ? payload.device_time_local : null;
-        spn1TimeStatusEl.textContent = parsed ? "Available" : "Unavailable";
-        spn1UnitTimeEl.textContent = unitTime || "Unavailable";
-        spn1TimeResultEl.textContent = parsed ? "SPN1 clock refreshed after sync" : "Unavailable";
-      }
-
-      async function refreshSpn1Time() {
-        const response = await fetch("/spn1/time");
-        const payload = await response.json();
-        showDeviceTime(payload);
-      }
-
-      async function syncSpn1Time() {
-        if (runActive) {
-          spn1TimeMessageEl.textContent = "Stop the run before syncing SPN1 time.";
-          return;
-        }
-        spn1TimeMessageEl.textContent = "Syncing...";
-        const response = await fetch("/spn1/time/sync", { method: "POST" });
-        const payload = await response.json();
-        if (!response.ok) {
-          spn1TimeMessageEl.textContent = payload.detail || "Sync failed.";
-          return;
-        }
-        spn1TimeMessageEl.textContent = payload.status === "ok" ? "Sync complete." : "Sync failed.";
-        await refreshSpn1Time();
-      }
-
       document.getElementById("start-button").addEventListener("click", () => {
         setRunActive(true).catch(console.error);
       });
 
       document.getElementById("stop-button").addEventListener("click", () => {
         setRunActive(false).catch(console.error);
-      });
-
-      spn1TimeSyncButton.addEventListener("click", () => {
-        syncSpn1Time().catch(console.error);
       });
 
       refreshState().catch(console.error);
