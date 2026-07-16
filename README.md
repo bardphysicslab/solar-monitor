@@ -93,6 +93,45 @@ service name used by the template deployment:
 ./scripts/restart_service.sh
 ```
 
+## Local CSV Recording
+
+Solar Monitor can record averaged CSV rows for each configured driver while the
+run state is active. Add a `recording` block inside each driver's `config`:
+
+```json
+"recording": {
+  "enabled": true,
+  "interval_s": 10,
+  "mode": "mean"
+}
+```
+
+Each driver keeps one active averaging window. The window starts with the first
+valid `status: ok` sample after Start, closes when elapsed monotonic time
+reaches `interval_s`, and writes one averaged row to:
+
+```text
+data/sensor_data/<uid>/YYYY-MM-DD.csv
+```
+
+SPN1 rows contain:
+
+```text
+timestamp_utc,window_start_utc,window_end_utc,sample_count,total_w_m2,diffuse_w_m2,sun
+```
+
+Solar panel rows contain:
+
+```text
+timestamp_utc,window_start_utc,window_end_utc,sample_count,panel_voltage_1_v,panel_voltage_2_v,panel_voltage_3_v,panel_voltage_4_v,voltage_ok,rssi_dbm
+```
+
+Numeric fields are averaged independently from only valid finite numeric
+values. Missing values stay blank. SPN1 `sun` and solar `voltage_ok` use a
+majority vote, with ties resolved by the latest valid value in the window.
+Stopping the run or shutting down the app flushes any partial window that has at
+least one accepted sample.
+
 ## Repo Layout
 
 ```text

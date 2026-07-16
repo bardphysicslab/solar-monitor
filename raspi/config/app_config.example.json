@@ -10,7 +10,12 @@
       "config": {
         "host": "REPLACE_WITH_ESP32_IP",
         "port": 1234,
-        "timeout_s": 3
+        "timeout_s": 3,
+        "recording": {
+          "enabled": true,
+          "interval_s": 10,
+          "mode": "mean"
+        }
       }
     },
     {
@@ -20,7 +25,12 @@
         "port": "/dev/cu.PL2303G-USBtoUART1130",
         "baud": 9600,
         "auto_sync_time": true,
-        "sync_interval_hours": 24
+        "sync_interval_hours": 24,
+        "recording": {
+          "enabled": true,
+          "interval_s": 10,
+          "mode": "mean"
+        }
       }
     }
   ]

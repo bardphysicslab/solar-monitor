@@ -9,12 +9,39 @@ from raspi.drivers.spn1_driver import SPN1Driver
 from raspi.drivers.wifi_node_driver import WiFiNodeDriver
 
 
+class FakeRecorder:
+    def __init__(self):
+        self.started = 0
+        self.stopped = 0
+        self.samples = []
+        self.flush_due_calls = 0
+
+    def start(self):
+        self.started += 1
+
+    def stop(self):
+        self.stopped += 1
+
+    def add_reading(self, uid, reading):
+        self.samples.append((uid, reading))
+
+    def flush_due(self):
+        self.flush_due_calls += 1
+
+    def flush_all(self):
+        pass
+
+    def status(self):
+        return {"recording_enabled": False, "data_root": "/tmp/test", "drivers": {}}
+
+
 class MainMultiDeviceTest(unittest.TestCase):
     def setUp(self):
         self.original_drivers = main.DRIVERS
         self.original_primary = main.PRIMARY_DRIVER
         self.original_run_active = main.run_active
         self.original_readings = dict(main.latest_readings_by_uid)
+        self.original_recorder = main.RECORDER
 
         self.spn1 = SPN1Driver(uid="spn1-0001", port="/dev/null", baud=9600)
         self.wifi = WiFiNodeDriver(uid="bb-solar-pnl-001", host="192.0.2.10")
@@ -50,12 +77,14 @@ class MainMultiDeviceTest(unittest.TestCase):
         main.PRIMARY_DRIVER = self.spn1
         main.latest_readings_by_uid = {}
         main.run_active = False
+        main.RECORDER = FakeRecorder()
 
     def tearDown(self):
         main.DRIVERS = self.original_drivers
         main.PRIMARY_DRIVER = self.original_primary
         main.run_active = self.original_run_active
         main.latest_readings_by_uid = self.original_readings
+        main.RECORDER = self.original_recorder
 
     def test_spn1_remains_configured_with_wifi_enabled(self):
         self.assertTrue(any(isinstance(driver, SPN1Driver) for driver in main.DRIVERS))
@@ -64,9 +93,11 @@ class MainMultiDeviceTest(unittest.TestCase):
     def test_start_and_stop_toggle_global_polling_state(self):
         main.start_run()
         self.assertTrue(main.is_run_active())
+        self.assertEqual(main.RECORDER.started, 1)
 
         main.stop_run()
         self.assertFalse(main.is_run_active())
+        self.assertEqual(main.RECORDER.stopped, 1)
 
     def test_spn1_routes_still_exist(self):
         paths = {route.path for route in main.app.routes}
@@ -119,6 +150,8 @@ class MainMultiDeviceTest(unittest.TestCase):
 
         self.assertEqual(readings["spn1-0001"]["data"]["total_w_m2"], 10.1)
         self.assertEqual(readings["bb-solar-pnl-001"]["data"]["panel_voltage_v"], 9.497)
+        self.assertEqual([uid for uid, _reading in main.RECORDER.samples], ["spn1-0001", "bb-solar-pnl-001"])
+        self.assertEqual(main.RECORDER.flush_due_calls, 1)
 
 
 if __name__ == "__main__":

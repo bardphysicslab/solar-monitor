@@ -14,12 +14,15 @@ from fastapi.templating import Jinja2Templates
 
 from raspi.drivers.spn1_driver import SPN1Driver
 from raspi.drivers.wifi_node_driver import WiFiNodeDriver
+from raspi.recording.csv_recorder import CsvAveragingRecorder, recorder_configs_from_app_config
 
 
 BASE_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = BASE_DIR.parent
 STATIC_DIR = BASE_DIR / "static"
 TEMPLATES_DIR = BASE_DIR / "templates"
 DEFAULT_CONFIG_PATH = BASE_DIR / "config" / "app_config.json"
+DEFAULT_RECORDING_DATA_ROOT = PROJECT_ROOT / "data" / "sensor_data"
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Solar Monitor")
@@ -111,6 +114,10 @@ def load_drivers(config: Dict[str, Any]) -> List[Any]:
 
 DRIVERS = load_drivers(APP_CONFIG)
 PRIMARY_DRIVER = DRIVERS[0] if DRIVERS else None
+RECORDER = CsvAveragingRecorder(
+    recorder_configs_from_app_config(APP_CONFIG),
+    data_root=DEFAULT_RECORDING_DATA_ROOT,
+)
 
 
 def get_configured_spn1_driver() -> Optional[SPN1Driver]:
@@ -271,6 +278,10 @@ def poll_all_drivers_once() -> None:
         try:
             reading = driver.get_reading()
             set_latest_reading(driver_uid, reading)
+            try:
+                RECORDER.add_reading(driver_uid, reading)
+            except Exception as exc:
+                logger.warning("CSV recording failed to accept sample for %s: %s", driver_uid, exc)
         except Exception as exc:
             logger.warning("Driver polling failed for %s: %s", driver_uid, exc)
             set_latest_reading(
@@ -284,6 +295,10 @@ def poll_all_drivers_once() -> None:
                     "raw": None,
                 },
             )
+    try:
+        RECORDER.flush_due()
+    except Exception as exc:
+        logger.warning("CSV recording due-flush failed: %s", exc)
 
 
 def polling_loop() -> None:
@@ -370,6 +385,14 @@ def start_background_reader() -> None:
     sync_thread.start()
 
 
+@app.on_event("shutdown")
+def flush_recorders_on_shutdown() -> None:
+    try:
+        RECORDER.flush_all()
+    except Exception as exc:
+        logger.warning("CSV recording shutdown flush failed: %s", exc)
+
+
 @app.get("/")
 def dashboard(request: Request):
     return templates.TemplateResponse(
@@ -421,6 +444,7 @@ def get_app_health():
             "driver_count": len(DRIVERS),
             "run_active": is_run_active(),
             "spn1_time_sync": get_spn1_sync_status(),
+            "recording": RECORDER.status(),
         }
     )
 
@@ -447,6 +471,7 @@ def get_state():
             "latest_spn1_reading": latest_spn1_reading(),
             "latest_readings": latest_readings(),
             "spn1_time_sync": get_spn1_sync_status(),
+            "recording": RECORDER.status(),
         }
     )
 
@@ -474,6 +499,7 @@ def start_run():
     global run_active
     with state_lock:
         run_active = True
+    RECORDER.start()
     return JSONResponse({"run_active": True})
 
 
@@ -482,4 +508,5 @@ def stop_run():
     global run_active
     with state_lock:
         run_active = False
+    RECORDER.stop()
     return JSONResponse({"run_active": False})
