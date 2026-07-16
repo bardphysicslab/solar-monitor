@@ -1,4 +1,4 @@
-.venv/
+ .venv/
 __pycache__/
 *.pyc
 *.pyo
@@ -9,3 +9,17 @@ data/*
 # local runtime + config
 raspi/venv/
 raspi/config/app_config.json
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+.env
+data/*
+!data/.gitkeep
+
+# local runtime + config
+raspi/venv/
+raspi/config/app_config.json
+
+firmware/solar-node/src/secrets.h

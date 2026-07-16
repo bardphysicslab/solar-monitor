@@ -21,14 +21,14 @@ const char* WIFI_SSID = WIFI_SSID_VALUE;
 const char* WIFI_PASS = WIFI_PASS_VALUE;
 
 // -----------------------------------------------------------------------------
-// Device information
+// BardBox device information
 // -----------------------------------------------------------------------------
 
 #define DEVICE_UID DEVICE_UID_VALUE
-#define FW_VERSION "0.3.0"
+#define FW_VERSION "0.3.1"
 #define PROTOCOL_VERSION "bardbox-node-v1"
 #define NODE_TYPE "solar_panel"
-#define NODE_MODEL "ads1015_4channel_wifi"
+#define NODE_MODEL "ads1015_4panel_wifi"
 
 // -----------------------------------------------------------------------------
 // Timing
@@ -67,7 +67,7 @@ unsigned long lastSerialSampleMs = 0;
 unsigned long lastWifiAttemptMs = 0;
 
 // -----------------------------------------------------------------------------
-// Channel reading structure
+// ADC readings
 // -----------------------------------------------------------------------------
 
 struct AdcReadings {
@@ -85,11 +85,10 @@ float readChannelVoltage(uint8_t channel, bool& ok) {
     return NAN;
   }
 
-  int16_t raw = ads.readADC_SingleEnded(channel);
-  float voltage = ads.computeVolts(raw);
+  const int16_t raw = ads.readADC_SingleEnded(channel);
+  const float voltage = ads.computeVolts(raw);
 
   ok = isfinite(voltage);
-
   return voltage;
 }
 
@@ -109,7 +108,7 @@ AdcReadings readAllChannels() {
 }
 
 // -----------------------------------------------------------------------------
-// Print one voltage or nan
+// Output one voltage
 // -----------------------------------------------------------------------------
 
 void printSerialVoltage(float voltage, bool ok) {
@@ -139,10 +138,10 @@ void printClientVoltage(
 void sendTcpHeader(WiFiClient& client) {
   client.println(
     "HDR,v1,"
-    "a0_voltage_v,a0_ok,"
-    "a1_voltage_v,a1_ok,"
-    "a2_voltage_v,a2_ok,"
-    "a3_voltage_v,a3_ok,"
+    "panel_voltage_1_v,panel_voltage_1_ok,"
+    "panel_voltage_2_v,panel_voltage_2_ok,"
+    "panel_voltage_3_v,panel_voltage_3_ok,"
+    "panel_voltage_4_v,panel_voltage_4_ok,"
     "rssi_dbm"
   );
 }
@@ -163,7 +162,13 @@ void sendTcpInfo(WiFiClient& client) {
   client.print(" protocol=");
   client.print(PROTOCOL_VERSION);
 
-  client.print(" sensors=ADS1015_A0_A1_A2_A3");
+  client.print(
+    " sensors="
+    "panel_voltage_1_v,"
+    "panel_voltage_2_v,"
+    "panel_voltage_3_v,"
+    "panel_voltage_4_v"
+  );
 
   client.print(" adc=");
   client.print(
@@ -224,7 +229,7 @@ void sendTcpStatus(WiFiClient& client) {
 }
 
 bool sendTcpSample(WiFiClient& client) {
-  AdcReadings readings = readAllChannels();
+  const AdcReadings readings = readAllChannels();
 
   client.print("DAT,");
 
@@ -287,7 +292,13 @@ void printSerialInfo() {
 
   Serial.print(",transport=wifi_tcp");
 
-  Serial.print(",sensor=ADS1015_A0_A1_A2_A3");
+  Serial.print(
+    ",sensors="
+    "panel_voltage_1_v|"
+    "panel_voltage_2_v|"
+    "panel_voltage_3_v|"
+    "panel_voltage_4_v"
+  );
 
   Serial.print(",adc=");
   Serial.print(adsConnected ? 1 : 0);
@@ -328,21 +339,21 @@ void printSerialHeader() {
     "fw_version,"
     "protocol_version,"
     "transport,"
-    "a0_voltage_v,"
-    "a0_ok,"
-    "a1_voltage_v,"
-    "a1_ok,"
-    "a2_voltage_v,"
-    "a2_ok,"
-    "a3_voltage_v,"
-    "a3_ok,"
+    "panel_voltage_1_v,"
+    "panel_voltage_1_ok,"
+    "panel_voltage_2_v,"
+    "panel_voltage_2_ok,"
+    "panel_voltage_3_v,"
+    "panel_voltage_3_ok,"
+    "panel_voltage_4_v,"
+    "panel_voltage_4_ok,"
     "wifi,"
     "rssi_dbm"
   );
 }
 
 void printSerialRead() {
-  AdcReadings readings = readAllChannels();
+  const AdcReadings readings = readAllChannels();
 
   Serial.print(millis());
   Serial.print(",");
@@ -405,22 +416,6 @@ void processSerialCommand(const char* command) {
   } else if (strcasecmp(command, "PING") == 0) {
     Serial.println("PONG");
 
-  } else if (strcasecmp(command, "HEADER") == 0) {
-    printSerialHeader();
-
-  } else if (strcasecmp(command, "READ") == 0) {
-    printSerialRead();
-
-  } else if (strcasecmp(command, "START") == 0) {
-    serialStreaming = true;
-    lastSerialSampleMs = 0;
-
-    printSerialHeader();
-
-  } else if (strcasecmp(command, "STOP") == 0) {
-    serialStreaming = false;
-    Serial.println("STOP_OK");
-
   } else if (strcasecmp(command, "STATUS") == 0) {
     Serial.print("STATUS,");
 
@@ -446,6 +441,23 @@ void processSerialCommand(const char* command) {
         : "DISCONNECTED"
     );
 
+  } else if (strcasecmp(command, "HEADER") == 0) {
+    printSerialHeader();
+
+  } else if (strcasecmp(command, "READ") == 0) {
+    printSerialRead();
+
+  } else if (strcasecmp(command, "START") == 0) {
+    serialStreaming = true;
+    lastSerialSampleMs = 0;
+
+    Serial.println("START_OK");
+    printSerialHeader();
+
+  } else if (strcasecmp(command, "STOP") == 0) {
+    serialStreaming = false;
+    Serial.println("STOP_OK");
+
   } else {
     Serial.println("ERR,UNKNOWN_COMMAND");
   }
@@ -456,12 +468,9 @@ void handleSerialCommands() {
   static size_t commandIndex = 0;
 
   while (Serial.available() > 0) {
-    char character = (char)Serial.read();
+    const char character = (char)Serial.read();
 
-    if (
-      character == '\n' ||
-      character == '\r'
-    ) {
+    if (character == '\n' || character == '\r') {
       if (commandIndex > 0) {
         commandBuffer[commandIndex] = '\0';
 
@@ -478,10 +487,7 @@ void handleSerialCommands() {
 
     } else {
       commandIndex = 0;
-
-      Serial.println(
-        "ERR,COMMAND_TOO_LONG"
-      );
+      Serial.println("ERR,COMMAND_TOO_LONG");
     }
   }
 }
@@ -493,11 +499,9 @@ void handleSerialStreaming() {
 
   if (
     lastSerialSampleMs == 0 ||
-    millis() - lastSerialSampleMs >=
-      SAMPLE_INTERVAL_MS
+    millis() - lastSerialSampleMs >= SAMPLE_INTERVAL_MS
   ) {
     lastSerialSampleMs = millis();
-
     printSerialRead();
   }
 }
@@ -510,7 +514,7 @@ String readTcpCommand(WiFiClient& client) {
   String command;
 
   while (client.available()) {
-    char character = (char)client.read();
+    const char character = (char)client.read();
 
     if (character == '\r') {
       continue;
@@ -524,7 +528,6 @@ String readTcpCommand(WiFiClient& client) {
   }
 
   command.trim();
-
   return command;
 }
 
@@ -563,7 +566,6 @@ void handleTcpCommand(
 
   } else if (command == "STOP") {
     tcpStreaming = false;
-
     client.println("OK STOP");
 
   } else {
@@ -572,11 +574,11 @@ void handleTcpCommand(
 }
 
 // -----------------------------------------------------------------------------
-// HTTP plain-text page
+// HTTP plain-text status page
 // -----------------------------------------------------------------------------
 
 void handleHttpRoot() {
-  AdcReadings readings = readAllChannels();
+  const AdcReadings readings = readAllChannels();
 
   String body;
 
@@ -614,9 +616,9 @@ void handleHttpRoot() {
        channel < ADS_CHANNEL_COUNT;
        channel++) {
 
-    body += "a";
-    body += String(channel);
-    body += "_voltage_v=";
+    body += "panel_voltage_";
+    body += String(channel + 1);
+    body += "_v=";
 
     if (readings.ok[channel]) {
       body += String(
@@ -629,9 +631,10 @@ void handleHttpRoot() {
 
     body += "\n";
 
-    body += "a";
-    body += String(channel);
+    body += "panel_voltage_";
+    body += String(channel + 1);
     body += "_ok=";
+
     body += String(
       readings.ok[channel]
         ? 1
@@ -677,11 +680,11 @@ void handleHttpRoot() {
 }
 
 // -----------------------------------------------------------------------------
-// HTTP JSON page
+// HTTP JSON status page
 // -----------------------------------------------------------------------------
 
 void handleHttpJson() {
-  AdcReadings readings = readAllChannels();
+  const AdcReadings readings = readAllChannels();
 
   String body = "{";
 
@@ -719,9 +722,9 @@ void handleHttpJson() {
        channel < ADS_CHANNEL_COUNT;
        channel++) {
 
-    body += "\"a";
-    body += String(channel);
-    body += "_voltage_v\":";
+    body += "\"panel_voltage_";
+    body += String(channel + 1);
+    body += "_v\":";
 
     if (readings.ok[channel]) {
       body += String(
@@ -734,8 +737,8 @@ void handleHttpJson() {
 
     body += ",";
 
-    body += "\"a";
-    body += String(channel);
+    body += "\"panel_voltage_";
+    body += String(channel + 1);
     body += "_ok\":";
 
     body += String(
@@ -784,23 +787,15 @@ void handleHttpJson() {
 }
 
 // -----------------------------------------------------------------------------
-// Start TCP and HTTP servers
+// Start TCP and HTTP services
 // -----------------------------------------------------------------------------
 
 void startNetworkServices() {
   tcpServer.begin();
   tcpServer.setNoDelay(true);
 
-  webServer.on(
-    "/",
-    handleHttpRoot
-  );
-
-  webServer.on(
-    "/json",
-    handleHttpJson
-  );
-
+  webServer.on("/", handleHttpRoot);
+  webServer.on("/json", handleHttpJson);
   webServer.begin();
 
   Serial.print("TCP server: ");
@@ -832,7 +827,7 @@ void connectWifi() {
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
 
-  unsigned long connectionStartMs = millis();
+  const unsigned long connectionStartMs = millis();
 
   while (
     WiFi.status() != WL_CONNECTED &&
@@ -845,9 +840,7 @@ void connectWifi() {
   Serial.println();
 
   if (WiFi.status() == WL_CONNECTED) {
-    Serial.println(
-      "=== WIFI CONNECTED ==="
-    );
+    Serial.println("=== WIFI CONNECTED ===");
 
     Serial.print("IP: ");
     Serial.println(WiFi.localIP());
@@ -899,8 +892,8 @@ void setup() {
   );
 
   if (adsConnected) {
-    // ±4.096 V ADC full-scale setting.
-    // The physical inputs must remain within
+    // ±4.096 V ADC full-scale range.
+    // Physical inputs must remain within
     // the ADS1015 board supply rails.
     ads.setGain(GAIN_ONE);
 
@@ -909,7 +902,7 @@ void setup() {
     );
 
     Serial.println(
-      "Reading single-ended voltage from A0, A1, A2, and A3."
+      "Reading panel voltages from A0, A1, A2, and A3."
     );
 
   } else {
@@ -918,7 +911,7 @@ void setup() {
     );
 
     Serial.println(
-      "Check STEMMA QT cable and I2C address."
+      "Check the STEMMA QT cable and I2C address."
     );
   }
 
@@ -953,8 +946,7 @@ void loop() {
 
   webServer.handleClient();
 
-  WiFiClient newClient =
-    tcpServer.available();
+  WiFiClient newClient = tcpServer.available();
 
   if (newClient) {
     if (
@@ -967,9 +959,7 @@ void loop() {
     tcpClient = newClient;
     tcpClient.setTimeout(50);
 
-    Serial.println(
-      "TCP client connected"
-    );
+    Serial.println("TCP client connected");
   }
 
   if (
@@ -979,9 +969,7 @@ void loop() {
     tcpClient.stop();
     tcpStreaming = false;
 
-    Serial.println(
-      "TCP client disconnected"
-    );
+    Serial.println("TCP client disconnected");
   }
 
   if (
@@ -989,7 +977,7 @@ void loop() {
     tcpClient.connected() &&
     tcpClient.available()
   ) {
-    String command =
+    const String command =
       readTcpCommand(tcpClient);
 
     handleTcpCommand(
