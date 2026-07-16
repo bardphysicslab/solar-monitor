@@ -215,25 +215,27 @@
       }
 
       .device-section {
-        margin-top: 28px;
+        margin-top: 24px;
       }
 
       .section-title {
-        margin: 0 0 14px;
-        font-size: 22px;
+        margin: 0 0 12px;
+        font-size: 20px;
       }
 
       .wifi-grid {
         display: grid;
-        grid-template-columns: repeat(auto-fit, minmax(min(100%, 260px), 1fr));
-        gap: 20px;
+        align-items: start;
+        gap: 16px;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
       }
 
       .wifi-card {
         display: grid;
-        min-height: 260px;
+        min-width: 0;
         align-content: start;
-        gap: 16px;
+        gap: 12px;
+        padding: 16px;
       }
 
       .wifi-card-header {
@@ -244,17 +246,18 @@
       }
 
       .wifi-uid {
-        color: var(--muted);
+        color: var(--text);
         font-size: 13px;
         font-weight: 700;
+        line-height: 1.35;
         overflow-wrap: anywhere;
       }
 
       .wifi-badge {
         border: 1px solid currentColor;
         border-radius: 999px;
-        padding: 4px 9px;
-        font-size: 11px;
+        padding: 3px 8px;
+        font-size: 10px;
         font-weight: 800;
         letter-spacing: 0.08em;
       }
@@ -267,31 +270,68 @@
         color: var(--danger);
       }
 
-      .wifi-voltage {
-        display: grid;
-        justify-items: center;
-        gap: 4px;
-        padding: 10px 0;
+      .wifi-status-stopped,
+      .wifi-status-waiting,
+      .wifi-status-catchup {
+        color: var(--muted);
       }
 
-      .wifi-voltage-value {
-        font-size: clamp(34px, 4vw, 46px);
+      .panel-voltage-list {
+        display: grid;
+        gap: 8px;
+      }
+
+      .panel-voltage-row {
+        display: flex;
+        align-items: baseline;
+        justify-content: space-between;
+        gap: 12px;
+        border-top: 1px solid rgba(255, 255, 255, 0.07);
+        padding-top: 8px;
+      }
+
+      .panel-voltage-label {
+        color: var(--muted);
+        font-size: 13px;
+        font-weight: 700;
+      }
+
+      .panel-voltage-value {
+        color: var(--text);
+        font-size: 20px;
         font-weight: 800;
         line-height: 1.1;
-      }
-
-      .wifi-voltage-label {
-        color: var(--muted);
-        font-size: 12px;
-        font-weight: 700;
-        letter-spacing: 0.08em;
-        text-transform: uppercase;
+        white-space: nowrap;
       }
 
       .wifi-details {
         display: grid;
-        grid-template-columns: repeat(2, minmax(0, 1fr));
-        gap: 12px 16px;
+        gap: 8px;
+      }
+
+      .wifi-details details {
+        border-top: 1px solid rgba(255, 255, 255, 0.07);
+        padding-top: 8px;
+      }
+
+      .wifi-details summary {
+        color: var(--muted);
+        cursor: pointer;
+        font-size: 13px;
+        font-weight: 700;
+        list-style-position: inside;
+      }
+
+      .wifi-detail-grid {
+        display: grid;
+        gap: 7px;
+        margin-top: 8px;
+      }
+
+      .wifi-detail-row {
+        display: grid;
+        grid-template-columns: minmax(90px, auto) minmax(0, 1fr);
+        gap: 10px;
       }
 
       .wifi-detail-label {
@@ -300,25 +340,25 @@
       }
 
       .wifi-detail-value {
-        margin-top: 2px;
+        font-size: 12px;
         overflow-wrap: anywhere;
       }
 
-      @media (min-width: 1180px) {
-        .wifi-grid {
-          grid-template-columns: repeat(4, minmax(0, 1fr));
-        }
-      }
-
-      @media (max-width: 1179px) and (min-width: 900px) {
+      @media (max-width: 1200px) {
         .wifi-grid {
           grid-template-columns: repeat(3, minmax(0, 1fr));
         }
       }
 
-      @media (max-width: 899px) and (min-width: 560px) {
+      @media (max-width: 900px) {
         .wifi-grid {
           grid-template-columns: repeat(2, minmax(0, 1fr));
+        }
+      }
+
+      @media (max-width: 600px) {
+        .wifi-grid {
+          grid-template-columns: 1fr;
         }
       }
 
@@ -453,6 +493,7 @@
 
     <script>
       const pollIntervalMs = {{ poll_interval_ms }};
+      const configuredSolarNodes = {{ configured_wifi_nodes | tojson }};
       const maxPoints = 100;
       const totalValueEl = document.getElementById("total-value");
       const diffuseValueEl = document.getElementById("diffuse-value");
@@ -617,7 +658,7 @@
       }
 
       function formatVoltage(value) {
-        return typeof value === "number" ? `${value.toFixed(3)} V` : "—";
+        return typeof value === "number" ? `${value.toFixed(3)} V` : "— V";
       }
 
       function isSolarNodeReading(reading) {
@@ -632,63 +673,127 @@
         return "—";
       }
 
+      function getPanelVoltages(data) {
+        return [
+          data.panel_voltage_1_v ?? data.panel_voltage_v ?? null,
+          data.panel_voltage_2_v ?? null,
+          data.panel_voltage_3_v ?? null,
+          data.panel_voltage_4_v ?? null,
+        ];
+      }
+
+      function mergeSolarNodes(readings) {
+        const nodesByUid = new Map();
+
+        (configuredSolarNodes || []).forEach((node) => {
+          if (!node.uid) return;
+          nodesByUid.set(node.uid, { configured: node, reading: null });
+        });
+
+        (readings || []).filter(isSolarNodeReading).forEach((reading) => {
+          if (!reading.uid) return;
+          const existing = nodesByUid.get(reading.uid) || { configured: { uid: reading.uid }, reading: null };
+          existing.reading = reading;
+          nodesByUid.set(reading.uid, existing);
+        });
+
+        return Array.from(nodesByUid.values()).sort((a, b) =>
+          String(a.configured.uid || a.reading?.uid || "").localeCompare(String(b.configured.uid || b.reading?.uid || ""))
+        );
+      }
+
+      function nodeState(reading) {
+        if (!runActive) return "STOPPED";
+        if (!reading) return "WAITING";
+        if (reading.status === "ok") return "LIVE";
+        return "OFFLINE";
+      }
+
+      function stateClass(state) {
+        return {
+          STOPPED: "wifi-status-stopped",
+          WAITING: "wifi-status-waiting",
+          LIVE: "wifi-status-online",
+          OFFLINE: "wifi-status-offline",
+          CATCHUP: "wifi-status-catchup",
+        }[state] || "wifi-status-waiting";
+      }
+
+      function detailRow(label, value) {
+        return `
+          <div class="wifi-detail-row">
+            <div class="wifi-detail-label">${escapeHtml(label)}</div>
+            <div class="wifi-detail-value">${escapeHtml(formatValue(value))}</div>
+          </div>
+        `;
+      }
+
       function renderWifiNodes(readings) {
-        const cards = (readings || []).filter(isSolarNodeReading);
+        const cards = mergeSolarNodes(readings);
         if (!cards.length) {
           wifiNodeListEl.innerHTML = '<section class="card chart-panel wifi-card"><div class="reading">No BardBox solar node readings yet.</div></section>';
           return;
         }
 
-        wifiNodeListEl.innerHTML = cards.map((reading) => {
-          const data = reading.data || {};
-          const extended = reading.extended || {};
-          const isOnline = reading.status === "ok";
-          const statusClass = isOnline ? "wifi-status-online" : "wifi-status-offline";
-          const statusText = isOnline ? "LIVE" : "OFFLINE";
-          const error = reading.status === "error" ? extended.error : null;
+        wifiNodeListEl.innerHTML = cards.map(({ configured, reading }) => {
+          const data = reading?.data || {};
+          const extended = reading?.extended || {};
+          const state = nodeState(reading);
+          const statusClass = stateClass(state);
+          const error = reading?.status === "error" ? extended.error : null;
           const firmware = extended.fw || extended.firmware;
           const rssi = extended.rssi_dbm;
           const nodeModel = extended.node_model;
           const ipAddress = extended.ip;
-          const timestamp = reading.timestamp ? new Date(reading.timestamp).toLocaleString() : "No reading yet";
+          const uid = configured.uid || reading?.uid || "Unknown UID";
+          const timestamp = reading?.timestamp ? new Date(reading.timestamp).toLocaleString() : "—";
+          const panelVoltages = state === "LIVE" ? getPanelVoltages(data) : [null, null, null, null];
           const errorMarkup = error ? `<div class="time-message">${escapeHtml(error)}</div>` : "";
 
           return `
             <section class="card chart-panel wifi-card">
               <div class="wifi-card-header">
-                <div class="wifi-uid">${escapeHtml(reading.uid || "Unknown UID")}</div>
-                <div class="wifi-badge ${statusClass}">${escapeHtml(statusText)}</div>
+                <div class="wifi-uid">${escapeHtml(uid)}</div>
+                <div class="wifi-badge ${statusClass}">${escapeHtml(state)}</div>
               </div>
-              <h3 class="chart-title">Solar Panel Node</h3>
-              <div class="wifi-voltage">
-                <div class="wifi-voltage-value">${escapeHtml(formatVoltage(data.panel_voltage_v))}</div>
-                <div class="wifi-voltage-label">Panel Voltage</div>
+              <div class="panel-voltage-list">
+                ${panelVoltages.map((value, index) => `
+                  <div class="panel-voltage-row">
+                    <div class="panel-voltage-label">Panel ${index + 1}</div>
+                    <div class="panel-voltage-value">${escapeHtml(formatVoltage(value))}</div>
+                  </div>
+                `).join("")}
               </div>
               <div class="wifi-details">
-                <div>
-                  <div class="wifi-detail-label">Voltage OK</div>
-                  <div class="wifi-detail-value">${escapeHtml(formatVoltageOk(extended.voltage_ok))}</div>
-                </div>
-                <div>
-                  <div class="wifi-detail-label">RSSI</div>
-                  <div class="wifi-detail-value">${escapeHtml(formatValue(rssi, " dBm"))}</div>
-                </div>
-                <div>
-                  <div class="wifi-detail-label">Firmware</div>
-                  <div class="wifi-detail-value">${escapeHtml(formatValue(firmware))}</div>
-                </div>
-                <div>
-                  <div class="wifi-detail-label">Updated</div>
-                  <div class="wifi-detail-value">${escapeHtml(timestamp)}</div>
-                </div>
-                <div>
-                  <div class="wifi-detail-label">Node Model</div>
-                  <div class="wifi-detail-value">${escapeHtml(formatValue(nodeModel))}</div>
-                </div>
-                <div>
-                  <div class="wifi-detail-label">IP Address</div>
-                  <div class="wifi-detail-value">${escapeHtml(formatValue(ipAddress))}</div>
-                </div>
+                <details>
+                  <summary>Identity</summary>
+                  <div class="wifi-detail-grid">
+                    ${detailRow("Node type", extended.node_type)}
+                    ${detailRow("Node model", nodeModel)}
+                    ${detailRow("Firmware", firmware)}
+                    ${detailRow("Protocol", extended.protocol)}
+                    ${detailRow("IP address", ipAddress || configured.host)}
+                    ${detailRow("MAC address", extended.mac)}
+                  </div>
+                </details>
+                <details>
+                  <summary>Health</summary>
+                  <div class="wifi-detail-grid">
+                    ${detailRow("Voltage OK", formatVoltageOk(extended.voltage_ok))}
+                    ${detailRow("RSSI", rssi === undefined ? null : `${rssi} dBm`)}
+                    ${detailRow("Last updated", timestamp)}
+                    ${detailRow("Current state", state)}
+                    ${error ? detailRow("Error", error) : ""}
+                  </div>
+                </details>
+                <details>
+                  <summary>Hardware</summary>
+                  <div class="wifi-detail-grid">
+                    ${detailRow("Sensor count", extended.sensor_count)}
+                    ${detailRow("ADC", extended.adc)}
+                    ${detailRow("Sensors", extended.sensors)}
+                  </div>
+                </details>
               </div>
               ${errorMarkup}
             </section>
@@ -699,6 +804,7 @@
       async function setRunActive(active) {
         await fetch(active ? "/start" : "/stop", { method: "POST" });
         await refreshState();
+        await refreshWifiNodes();
       }
 
       function showRunState(runActive) {

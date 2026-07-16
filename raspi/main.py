@@ -175,22 +175,22 @@ def latest_readings() -> List[Dict[str, Any]]:
         ]
 
 
-def wifi_node_cards() -> List[Dict[str, Any]]:
-    cards = []
-    for driver in DRIVERS:
-        if not isinstance(driver, WiFiNodeDriver):
+def configured_wifi_nodes(config: Dict[str, Any]) -> List[Dict[str, Any]]:
+    nodes = []
+    for entry in config.get("drivers", []):
+        if entry.get("driver") != "wifi_node":
             continue
 
-        info = driver.get_info()
-        reading = latest_reading_for_driver(driver)
-        cards.append(
+        driver_config = entry.get("config", {})
+        nodes.append(
             {
-                "info": info,
-                "capabilities": driver.get_capabilities(),
-                "latest_reading": reading,
+                "uid": entry.get("uid"),
+                "driver": entry.get("driver"),
+                "host": driver_config.get("host"),
+                "port": driver_config.get("port", 1234),
             }
         )
-    return cards
+    return nodes
 
 
 def get_spn1_driver() -> SPN1Driver:
@@ -215,6 +215,7 @@ def dashboard(request: Request):
             "title": APP_CONFIG.get("title", "Solar Monitor"),
             "app_id": APP_CONFIG.get("app_id", "solar-monitor"),
             "poll_interval_ms": APP_CONFIG.get("poll_interval_ms", 1500),
+            "configured_wifi_nodes": configured_wifi_nodes(APP_CONFIG),
         },
     )
 

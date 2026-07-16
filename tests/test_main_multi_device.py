@@ -77,6 +77,28 @@ class MainMultiDeviceTest(unittest.TestCase):
         self.assertIn("/start", paths)
         self.assertIn("/stop", paths)
 
+    def test_configured_wifi_nodes_are_config_derived(self):
+        nodes = main.configured_wifi_nodes(
+            {
+                "drivers": [
+                    {"driver": "wifi_node", "uid": "bb-solar-pnl-001", "config": {"host": "192.0.2.10", "port": 1234}},
+                    {"driver": "spn1", "uid": "spn1-0001", "config": {"port": "/dev/null"}},
+                ]
+            }
+        )
+
+        self.assertEqual(
+            nodes,
+            [
+                {
+                    "uid": "bb-solar-pnl-001",
+                    "driver": "wifi_node",
+                    "host": "192.0.2.10",
+                    "port": 1234,
+                }
+            ],
+        )
+
     def test_wifi_parse_error_does_not_remove_or_overwrite_spn1_reading(self):
         self.wifi.get_reading = lambda: (_ for _ in ()).throw(ValueError("bad Wi-Fi frame"))
 
