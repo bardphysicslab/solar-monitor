@@ -3,6 +3,12 @@
   "mode": "sensor_monitor",
   "poll_interval_ms": 1500,
   "title": "Solar Monitor",
+  "backup": {
+    "enabled": true,
+    "interval_minutes": 30,
+    "remote": "REPLACE_WITH_EXISTING_RCLONE_REMOTE",
+    "destination": "solar-monitor"
+  },
   "drivers": [
     {
       "driver": "wifi_node",

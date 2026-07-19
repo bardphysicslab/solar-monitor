@@ -156,6 +156,25 @@ class CsvRecorderTest(unittest.TestCase):
             self.assertEqual(rows[1]["total_w_m2"], "200.000")
             self.assertEqual(rows[1]["sample_count"], "1")
 
+    def test_thirty_second_run_with_ten_second_windows_writes_three_rows(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            recorder = self.make_recorder(
+                [RecorderConfig("spn1-0001", "spn1", enabled=True, interval_s=10)],
+                temp_dir,
+            )
+
+            for second in range(30):
+                recorder.add_reading("spn1-0001", spn1_reading(100 + second, 30, second % 2))
+                self.clock.advance(1)
+                recorder.flush_due()
+
+            rows = self.rows_for(temp_dir, "spn1-0001")
+            self.assertEqual(len(rows), 3)
+            self.assertEqual([row["sample_count"] for row in rows], ["10", "10", "10"])
+            self.assertEqual(rows[0]["total_w_m2"], "104.500")
+            self.assertEqual(rows[1]["total_w_m2"], "114.500")
+            self.assertEqual(rows[2]["total_w_m2"], "124.500")
+
     def test_binary_tie_uses_latest_valid_value(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             recorder = self.make_recorder(

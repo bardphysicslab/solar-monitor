@@ -132,6 +132,52 @@ majority vote, with ties resolved by the latest valid value in the window.
 Stopping the run or shutting down the app flushes any partial window that has at
 least one accepted sample.
 
+SPN1 acquisition runs in its own background loop so slow Wi-Fi-node polling does
+not delay fresh SPN1 serial samples. The SPN1 driver sends one `S` command for
+each acquisition and records only that fresh response; identical cached
+`timestamp`/`raw` readings are not counted twice.
+
+Recorder windows currently use elapsed monotonic time beginning with the first
+fresh sample in the window. They are not UTC-boundary aligned yet, but the row
+timestamps and daily file rotation are UTC.
+
+## BardBox Drive Backup
+
+Local CSV files remain the authoritative data source. Configure snapshot-based
+rclone backups at the top level of `raspi/config/app_config.json`:
+
+```json
+"backup": {
+  "enabled": true,
+  "interval_minutes": 30,
+  "remote": "REPLACE_WITH_EXISTING_RCLONE_REMOTE",
+  "destination": "solar-monitor"
+}
+```
+
+Backups are scheduled by `solar-monitor-backup.timer`, not by the web
+application process. There should be only one backup scheduler enabled on the
+Pi.
+
+When the timer runs, the backup script briefly locks the recorder, flushes any
+completed windows, copies the complete `data/sensor_data` directory to a stable
+snapshot under `data/backup_snapshots`, then runs `rclone sync` against the
+snapshot. Sensor acquisition is not paused during the network upload.
+
+To generate systemd units from the configured interval on the Pi:
+
+```bash
+sudo ./scripts/install_backup_timer.py --config raspi/config/app_config.json
+sudo systemctl daemon-reload
+sudo systemctl enable --now solar-monitor-backup.timer
+```
+
+Preview the generated unit files without installing them:
+
+```bash
+./scripts/install_backup_timer.py --config raspi/config/app_config.json --dry-run
+```
+
 ## Repo Layout
 
 ```text
