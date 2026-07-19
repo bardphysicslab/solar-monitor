@@ -57,6 +57,10 @@ class SPN1Driver:
             "time_sync": {"label": "Sync SPN1 clock to server time", "dangerous": False},
         }
 
+    def close(self) -> None:
+        with self._lock:
+            self._close()
+
     def get_reading(self) -> dict:
         raw = ""
         try:
