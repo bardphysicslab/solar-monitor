@@ -218,3 +218,36 @@ This template should be kept aligned with the Bard Box standards repo, especiall
 - The example app serves fake but realistic normalized readings.
 - No real hardware is required to boot the template.
 - The header already includes a Bard logo, a human-readable deployment title, and a live clock.
+
+## BardBox Operations
+
+After a Git update changes `raspi/config/app_config.example.json`, preview the
+safe configuration merge:
+
+```bash
+python3 scripts/sync_app_config.py
+```
+
+Apply the reviewed merge with:
+
+```bash
+python3 scripts/sync_app_config.py --write
+```
+
+This recursively adds new fields while preserving deployment-specific values,
+secrets, and unknown local fields, so it is safe to use after `git pull`.
+
+### Read-only Data API
+
+Set a dedicated non-empty token in the ignored production `app_config.json`:
+
+```json
+"data_api": { "token": "<dedicated read-only token>" }
+```
+
+An absent or empty token fails closed. Generic consumers such as `bardbox-mcp`
+authenticate with `Authorization: Bearer <token>` and may recursively list CSV
+files with `GET /api/data/files` or download one with
+`GET /api/data/files/{path}`. The API exposes only `.csv` and `.csv.gz` files
+beneath `data/sensor_data/`; it is read-only and performs no analysis or admin
+operations. Successful responses use `Cache-Control: no-store`.

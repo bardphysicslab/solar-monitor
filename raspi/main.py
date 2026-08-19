@@ -16,6 +16,7 @@ from raspi.drivers.spn1_driver import SPN1Driver
 from raspi.drivers.wifi_node_driver import WiFiNodeDriver
 from raspi.backup import DataBackupManager, backup_config_from_app_config
 from raspi.recording.csv_recorder import CsvAveragingRecorder, recorder_configs_from_app_config
+from raspi.data_api import create_data_api_router
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -61,6 +62,7 @@ def load_config() -> Dict[str, Any]:
 
 
 APP_CONFIG = load_config()
+app.include_router(create_data_api_router(DEFAULT_RECORDING_DATA_ROOT, APP_CONFIG))
 
 
 def parse_spn1_sync_interval_hours(value: Any, uid: str) -> float:

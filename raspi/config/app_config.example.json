@@ -3,6 +3,9 @@
   "mode": "sensor_monitor",
   "poll_interval_ms": 1500,
   "title": "Solar Monitor",
+  "data_api": {
+    "token": ""
+  },
   "backup": {
     "enabled": true,
     "interval_minutes": 30,
