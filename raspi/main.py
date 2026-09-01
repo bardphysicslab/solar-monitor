@@ -1,3 +1,4 @@
+from collections import deque
 import json
 import logging
 import os
@@ -15,8 +16,10 @@ from fastapi.templating import Jinja2Templates
 from raspi.drivers.et54_driver import ET54Driver
 from raspi.drivers.spn1_driver import SPN1Driver
 from raspi.drivers.wifi_node_driver import WiFiNodeDriver
+from raspi.load_control import ElectronicLoadController, LoadControlError
 from raspi.backup import DataBackupManager, backup_config_from_app_config
 from raspi.recording.csv_recorder import CsvAveragingRecorder, recorder_configs_from_app_config
+from raspi.recording.sweep_recorder import SweepRecorder
 from raspi.data_api import create_data_api_router
 
 
@@ -39,6 +42,9 @@ last_recorded_signatures_by_uid: Dict[str, str] = {}
 state_lock = threading.Lock()
 sync_status_lock = threading.Lock()
 shutdown_event = threading.Event()
+spn1_sample_lock = threading.Lock()
+spn1_irradiance_samples = deque(maxlen=10000)
+sweep_threads: Dict[str, threading.Thread] = {}
 spn1_sync_status: Dict[str, Any] = {
     "auto_sync_enabled": False,
     "sync_interval_hours": 24,
@@ -50,6 +56,22 @@ spn1_sync_status: Dict[str, Any] = {
 
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def record_spn1_irradiance(reading: Dict[str, Any]) -> None:
+    if reading.get("status") != "ok":
+        return
+    value = (reading.get("data") or {}).get("total_w_m2")
+    if not isinstance(value, (int, float)):
+        return
+    timestamp = reading.get("timestamp") or utc_now().strftime("%Y-%m-%dT%H:%M:%SZ")
+    with spn1_sample_lock:
+        spn1_irradiance_samples.append((timestamp, float(value)))
+
+
+def irradiance_values_between(start: str, end: str) -> List[float]:
+    with spn1_sample_lock:
+        return [value for timestamp, value in spn1_irradiance_samples if start <= timestamp <= end]
 
 
 def local_now() -> datetime:
@@ -133,8 +155,36 @@ def load_drivers(config: Dict[str, Any]) -> List[Any]:
     return loaded
 
 
+def panel_config_by_uid(config: Dict[str, Any], panel_uid: str) -> Optional[Dict[str, Any]]:
+    for entry in config.get("drivers", []):
+        if entry.get("driver") == "wifi_node" and entry.get("uid") == panel_uid:
+            return entry
+    return None
+
+
+def build_load_controllers(config: Dict[str, Any], drivers: List[Any], sweep_recorder: SweepRecorder) -> Dict[str, ElectronicLoadController]:
+    entries = {entry.get("uid"): entry for entry in config.get("drivers", [])}
+    controllers = {}
+    for driver in drivers:
+        if not isinstance(driver, ET54Driver):
+            continue
+        entry = entries.get(driver.uid) or {}
+        driver_config = entry.get("config") or {}
+        panel_uid = driver_config.get("panel_uid")
+        controllers[driver.uid] = ElectronicLoadController(
+            driver=driver,
+            load_config=driver_config,
+            panel_config=panel_config_by_uid(config, panel_uid) if panel_uid else None,
+            irradiance_provider=irradiance_values_between,
+            sweep_result_sink=sweep_recorder.record,
+        )
+    return controllers
+
+
 DRIVERS = load_drivers(APP_CONFIG)
 PRIMARY_DRIVER = DRIVERS[0] if DRIVERS else None
+SWEEP_RECORDER = SweepRecorder(DEFAULT_RECORDING_DATA_ROOT)
+LOAD_CONTROLLERS = build_load_controllers(APP_CONFIG, DRIVERS, SWEEP_RECORDER)
 RECORDER = CsvAveragingRecorder(
     recorder_configs_from_app_config(APP_CONFIG),
     data_root=DEFAULT_RECORDING_DATA_ROOT,
@@ -334,7 +384,13 @@ def poll_all_drivers_once() -> None:
 def poll_driver_once(driver: Any) -> None:
     driver_uid = getattr(driver, "uid", "unknown")
     try:
-        reading = driver.get_reading()
+        controller = LOAD_CONTROLLERS.get(driver_uid)
+        if controller is not None:
+            reading = controller.poll_reading()
+        else:
+            reading = driver.get_reading()
+        if isinstance(driver, SPN1Driver):
+            record_spn1_irradiance(reading)
         set_latest_reading(driver_uid, reading)
         try:
             if is_fresh_for_recording(driver_uid, reading):
@@ -375,6 +431,9 @@ def generic_polling_loop(stop_event: threading.Event = shutdown_event, poll_inte
             for driver in drivers:
                 if stop_event.is_set():
                     break
+                controller = LOAD_CONTROLLERS.get(getattr(driver, "uid", ""))
+                if controller is not None and controller.state()["sweep_state"] == "running":
+                    continue
                 poll_driver_once(driver)
             stop_event.wait(poll_interval_s)
         else:
@@ -434,19 +493,33 @@ def latest_readings() -> List[Dict[str, Any]]:
 
 def configured_wifi_nodes(config: Dict[str, Any]) -> List[Dict[str, Any]]:
     nodes = []
+    loads_by_panel = {}
+    for entry in config.get("drivers", []):
+        if entry.get("driver") != "et54":
+            continue
+        driver_config = entry.get("config") or {}
+        panel_uid = driver_config.get("panel_uid")
+        if panel_uid:
+            loads_by_panel[panel_uid] = {
+                "uid": entry.get("uid"),
+                "load_type": driver_config.get("load_type", "electronic_load"),
+                "driver": entry.get("driver"),
+            }
     for entry in config.get("drivers", []):
         if entry.get("driver") != "wifi_node":
             continue
 
         driver_config = entry.get("config", {})
-        nodes.append(
-            {
-                "uid": entry.get("uid"),
-                "driver": entry.get("driver"),
-                "host": driver_config.get("host"),
-                "port": driver_config.get("port", 1234),
-            }
-        )
+        node = {
+            "uid": entry.get("uid"),
+            "driver": entry.get("driver"),
+            "host": driver_config.get("host"),
+            "port": driver_config.get("port", 1234),
+        }
+        load = loads_by_panel.get(entry.get("uid"))
+        if load is not None:
+            node["load"] = load
+        nodes.append(node)
     return nodes
 
 
@@ -481,6 +554,11 @@ def flush_recorders_on_shutdown() -> None:
         RECORDER.flush_all()
     except Exception as exc:
         logger.warning("CSV recording shutdown flush failed: %s", exc)
+    for controller in LOAD_CONTROLLERS.values():
+        try:
+            controller.disable()
+        except Exception as exc:
+            logger.warning("Electronic load shutdown disable failed for %s: %s", controller.uid, exc)
     for driver in DRIVERS:
         if hasattr(driver, "close"):
             driver.close()
@@ -589,6 +667,83 @@ def sync_spn1_time():
     return JSONResponse(sync_spn1_time_once(reason="manual"))
 
 
+def get_load_controller(uid: str) -> ElectronicLoadController:
+    controller = LOAD_CONTROLLERS.get(uid)
+    if controller is None:
+        raise HTTPException(status_code=404, detail="Electronic load not configured")
+    return controller
+
+
+def load_error_response(exc: Exception) -> JSONResponse:
+    return JSONResponse({"status": "error", "error": str(exc)}, status_code=400)
+
+
+@app.get("/loads")
+def get_loads():
+    return JSONResponse({"loads": [controller.state() for controller in LOAD_CONTROLLERS.values()]})
+
+
+@app.post("/loads/{uid}/select")
+async def select_load_mode(uid: str, request: Request):
+    controller = get_load_controller(uid)
+    payload = await request.json()
+    try:
+        return JSONResponse(controller.select_mode(payload.get("mode"), payload.get("resistance_ohm")))
+    except (LoadControlError, ValueError) as exc:
+        return load_error_response(exc)
+
+
+@app.post("/loads/{uid}/step")
+async def step_load_resistance(uid: str, request: Request):
+    controller = get_load_controller(uid)
+    payload = await request.json()
+    try:
+        return JSONResponse(controller.select_resistance_step(float(payload.get("step_ohm")), int(payload.get("direction"))))
+    except (LoadControlError, ValueError, TypeError) as exc:
+        return load_error_response(exc)
+
+
+@app.post("/loads/{uid}/fixed/enable")
+def enable_fixed_load(uid: str):
+    try:
+        return JSONResponse(get_load_controller(uid).enable_fixed())
+    except Exception as exc:
+        return load_error_response(exc)
+
+
+@app.post("/loads/{uid}/fixed/apply")
+async def apply_fixed_load(uid: str, request: Request):
+    payload = await request.json()
+    try:
+        return JSONResponse(get_load_controller(uid).apply_fixed(payload.get("resistance_ohm")))
+    except Exception as exc:
+        return load_error_response(exc)
+
+
+@app.post("/loads/{uid}/disable")
+async def disable_load(uid: str, request: Request):
+    payload = await request.json()
+    try:
+        return JSONResponse(get_load_controller(uid).disable(bool(payload.get("clear_fault", False))))
+    except Exception as exc:
+        return load_error_response(exc)
+
+
+@app.post("/loads/{uid}/sweep/start")
+def start_load_sweep(uid: str):
+    controller = get_load_controller(uid)
+    if controller.state()["sweep_state"] == "running":
+        return load_error_response(LoadControlError("Sweep already running"))
+    try:
+        controller.validate_sweep_configuration()
+    except LoadControlError as exc:
+        return load_error_response(exc)
+    thread = threading.Thread(target=controller.run_sweep, daemon=True)
+    sweep_threads[uid] = thread
+    thread.start()
+    return JSONResponse(controller.state(), status_code=202)
+
+
 @app.post("/start")
 def start_run():
     global run_active
@@ -602,6 +757,11 @@ def start_run():
 @app.post("/stop")
 def stop_run():
     global run_active
+    for controller in LOAD_CONTROLLERS.values():
+        try:
+            controller.disable()
+        except Exception as exc:
+            logger.warning("Electronic load stop failed for %s: %s", controller.uid, exc)
     with state_lock:
         run_active = False
     RECORDER.stop()

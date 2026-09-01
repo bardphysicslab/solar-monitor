@@ -20,6 +20,18 @@
         "host": "REPLACE_WITH_ESP32_IP",
         "port": 1234,
         "timeout_s": 3,
+        "limits": {
+          "absolute": {
+            "max_voltage_v": "REPLACE_WITH_PANEL_MANUFACTURER_RATING",
+            "max_current_a": "REPLACE_WITH_PANEL_MANUFACTURER_RATING",
+            "max_power_w": "REPLACE_WITH_PANEL_MANUFACTURER_RATING"
+          },
+          "operating": {
+            "max_voltage_v": "REPLACE_WITH_CONSERVATIVE_WORKING_LIMIT",
+            "max_current_a": "REPLACE_WITH_CONSERVATIVE_WORKING_LIMIT",
+            "max_power_w": "REPLACE_WITH_CONSERVATIVE_WORKING_LIMIT"
+          }
+        },
         "recording": {
           "enabled": true,
           "interval_s": 10,
@@ -46,10 +58,49 @@
       "driver": "et54",
       "uid": "yertai-et5406a-plus-001",
       "config": {
+        "panel_uid": "bb-solar-pnl-001",
+        "load_type": "electronic_load",
         "port": "/dev/serial/by-id/REPLACE_ME",
         "baud": 9600,
         "mode": "CR",
-        "resistance_ohm": 100,
+        "resistance_ohm": 800,
+        "default_selected_mode": "fixed_resistance",
+        "limits": {
+          "absolute": {
+            "max_voltage_v": 120,
+            "max_current_a": 20,
+            "max_power_w": 200,
+            "min_load_resistance_ohm": 0.05,
+            "max_load_resistance_ohm": 4500
+          },
+          "operating": {
+            "max_voltage_v": "REPLACE_WITH_CONSERVATIVE_WORKING_LIMIT",
+            "max_current_a": "REPLACE_WITH_CONSERVATIVE_WORKING_LIMIT",
+            "max_power_w": "REPLACE_WITH_CONSERVATIVE_WORKING_LIMIT",
+            "min_load_resistance_ohm": "REPLACE_WITH_SAFE_SYSTEM_MINIMUM",
+            "max_load_resistance_ohm": 4500
+          }
+        },
+        "cr": {
+          "default_resistance_ohm": 800,
+          "min_load_resistance_ohm": "REPLACE_WITH_SAFE_SYSTEM_MINIMUM",
+          "max_load_resistance_ohm": 4500
+        },
+        "sweep": {
+          "interval_s": 10,
+          "settle_s": 0.5,
+          "min_load_resistance_ohm": "REPLACE_WITH_SAFE_SYSTEM_MINIMUM",
+          "max_load_resistance_ohm": 4500,
+          "resistance_values_ohm": [
+            "REPLACE_WITH_SAFE_HIGH_RESISTANCE",
+            "REPLACE_WITH_SAFE_INTERMEDIATE_RESISTANCE",
+            "REPLACE_WITH_SAFE_LOW_RESISTANCE"
+          ]
+        },
+        "irradiance_quality": {
+          "max_std_w_m2": "REPLACE_WITH_STUDY_THRESHOLD",
+          "max_relative_range": "REPLACE_WITH_STUDY_THRESHOLD"
+        },
         "recording": {
           "enabled": true,
           "interval_s": 10,

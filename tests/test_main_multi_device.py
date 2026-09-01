@@ -52,6 +52,7 @@ class MainMultiDeviceTest(unittest.TestCase):
         self.original_signatures = dict(main.last_recorded_signatures_by_uid)
         self.original_recorder = main.RECORDER
         self.original_backup_manager = main.BACKUP_MANAGER
+        self.original_load_controllers = main.LOAD_CONTROLLERS
 
         self.spn1 = SPN1Driver(uid="spn1-0001", port="/dev/null", baud=9600)
         self.wifi = WiFiNodeDriver(uid="bb-solar-pnl-001", host="192.0.2.10")
@@ -90,6 +91,7 @@ class MainMultiDeviceTest(unittest.TestCase):
         main.run_active = False
         main.RECORDER = FakeRecorder()
         main.BACKUP_MANAGER = FakeBackupManager()
+        main.LOAD_CONTROLLERS = {}
 
     def tearDown(self):
         main.DRIVERS = self.original_drivers
@@ -99,6 +101,7 @@ class MainMultiDeviceTest(unittest.TestCase):
         main.last_recorded_signatures_by_uid = self.original_signatures
         main.RECORDER = self.original_recorder
         main.BACKUP_MANAGER = self.original_backup_manager
+        main.LOAD_CONTROLLERS = self.original_load_controllers
 
     def test_spn1_remains_configured_with_wifi_enabled(self):
         self.assertTrue(any(isinstance(driver, SPN1Driver) for driver in main.DRIVERS))
@@ -227,6 +230,64 @@ class MainMultiDeviceTest(unittest.TestCase):
 
         main.DRIVERS = [self.spn1, drivers[0], self.wifi]
         self.assertEqual(main.polled_drivers(), [drivers[0], self.wifi])
+
+    def test_panel_load_association_is_explicit_and_unassigned_panels_remain_unassigned(self):
+        nodes = main.configured_wifi_nodes(
+            {
+                "drivers": [
+                    {"driver": "wifi_node", "uid": "panel-001", "config": {"host": "192.0.2.1"}},
+                    {"driver": "wifi_node", "uid": "panel-002", "config": {"host": "192.0.2.2"}},
+                    {
+                        "driver": "et54",
+                        "uid": "load-001",
+                        "config": {"panel_uid": "panel-001", "load_type": "electronic_load"},
+                    },
+                ]
+            }
+        )
+        by_uid = {node["uid"]: node for node in nodes}
+        self.assertEqual(by_uid["panel-001"]["load"]["uid"], "load-001")
+        self.assertEqual(by_uid["panel-001"]["load"]["load_type"], "electronic_load")
+        self.assertNotIn("load", by_uid["panel-002"])
+
+    def test_running_sweep_is_skipped_without_blocking_other_generic_drivers(self):
+        class RunningController:
+            def state(self):
+                return {"sweep_state": "running"}
+
+        et54 = ET54Driver(uid="load-001", port="/dev/null")
+        main.DRIVERS = [et54, self.wifi]
+        main.LOAD_CONTROLLERS = {"load-001": RunningController()}
+        main.run_active = True
+        stop_event = threading.Event()
+        original_wifi_reading = self.wifi.get_reading
+
+        def wifi_reading_and_stop():
+            stop_event.set()
+            return original_wifi_reading()
+
+        self.wifi.get_reading = wifi_reading_and_stop
+        thread = threading.Thread(target=main.generic_polling_loop, args=(stop_event, 0.01))
+        thread.start()
+        thread.join(timeout=1)
+        self.assertFalse(thread.is_alive())
+        self.assertIn(("bb-solar-pnl-001", self.wifi_reading), main.RECORDER.samples)
+
+    def test_unsafe_sweep_is_rejected_before_background_thread_starts(self):
+        class UnsafeController:
+            def state(self):
+                return {"sweep_state": "idle"}
+
+            def validate_sweep_configuration(self):
+                raise main.LoadControlError("panel operating limits are required")
+
+        main.sweep_threads.pop("load-001", None)
+        main.LOAD_CONTROLLERS = {"load-001": UnsafeController()}
+        response = main.start_load_sweep("load-001")
+        payload = json.loads(response.body)
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("panel operating limits", payload["error"])
+        self.assertNotIn("load-001", main.sweep_threads)
 
 
 if __name__ == "__main__":

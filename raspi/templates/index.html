@@ -344,6 +344,87 @@
         overflow-wrap: anywhere;
       }
 
+      .load-summary {
+        display: flex;
+        justify-content: space-between;
+        gap: 8px;
+      }
+
+      .load-controls {
+        display: grid;
+        gap: 12px;
+        margin-top: 10px;
+      }
+
+      .load-mode-buttons,
+      .load-actions {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+      }
+
+      .load-mode-buttons button,
+      .load-actions button,
+      .digit-stepper button {
+        padding: 7px 10px;
+        font-size: 12px;
+      }
+
+      button[disabled] {
+        cursor: not-allowed;
+        opacity: 0.42;
+      }
+
+      .load-mode-selected {
+        border-color: var(--accent);
+        color: var(--accent);
+      }
+
+      .load-stop {
+        border-color: var(--danger);
+        color: #ff7b83;
+      }
+
+      .digit-stepper-wrap {
+        display: grid;
+        justify-items: start;
+        gap: 6px;
+      }
+
+      .digit-stepper {
+        display: grid;
+        grid-template-columns: repeat(3, 42px);
+        gap: 5px;
+      }
+
+      .digit-value {
+        min-width: 136px;
+        border: 1px solid var(--panel-border);
+        border-radius: 8px;
+        padding: 8px 12px;
+        text-align: center;
+        font-size: 24px;
+        font-variant-numeric: tabular-nums;
+        font-weight: 800;
+      }
+
+      .load-message {
+        border-left: 3px solid var(--panel-border);
+        padding-left: 9px;
+        color: var(--muted);
+        font-size: 12px;
+        line-height: 1.4;
+      }
+
+      .load-message-error {
+        border-left-color: var(--danger);
+        color: #ff9da3;
+      }
+
+      .load-active {
+        color: var(--accent-2);
+      }
+
       @media (max-width: 1200px) {
         .wifi-grid {
           grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -470,7 +551,7 @@
       </div>
 
       <section class="device-section" aria-labelledby="bardbox-node-title">
-        <h2 class="section-title" id="bardbox-node-title">BardBox Wi-Fi Nodes</h2>
+        <h2 class="section-title" id="bardbox-node-title">Solar Panels</h2>
         <div class="wifi-grid" id="wifi-node-list"></div>
       </section>
     </div>
@@ -493,6 +574,7 @@
         "bb-solar-pnl-004",
       ];
       const openSolarDetails = new Set();
+      let loadStatesByUid = new Map();
       let lastSpn1Timestamp = null;
       let runActive = false;
 
@@ -723,6 +805,135 @@
         return `${uid}:${section}`;
       }
 
+      function formatResistanceKohm(valueOhm) {
+        return typeof valueOhm === "number" ? `${(valueOhm / 1000).toFixed(2)} kOhm` : "--.-- kOhm";
+      }
+
+      function loadStatusText(load) {
+        if (!load) return "Not assigned";
+        if (load.sweep_state === "running") return "Sweep Running";
+        if (load.active_mode === "fixed_resistance" && load.input_enabled) return "CR Active";
+        if (load.safety_state === "safety_fault") return "Safety Fault";
+        if (load.safety_state === "instrument_error") return "Instrument Error";
+        if (!load.safety_config_complete) return "Unavailable";
+        return "Disabled";
+      }
+
+      function loadFoldout(uid, configuredLoad, load) {
+        if (!configuredLoad) {
+          return `
+            <details data-detail-key="${escapeHtml(detailKey(uid, "load"))}">
+              <summary><span class="load-summary"><span>Load</span><span>Not assigned</span></span></summary>
+              <div class="load-message">No load is explicitly associated with this panel.</div>
+            </details>
+          `;
+        }
+        const state = load || {
+          uid: configuredLoad.uid,
+          load_type: configuredLoad.load_type,
+          device: "ET5406A+",
+          selected_mode: "fixed_resistance",
+          active_mode: null,
+          input_enabled: false,
+          safety_state: "unavailable",
+          safety_message: "Load state unavailable",
+          resistance_setpoint_ohm: null,
+          sweep_state: "idle",
+          safety_config_complete: false,
+        };
+        const loadUid = state.uid || configuredLoad.uid;
+        const status = loadStatusText(state);
+        const fixedSelected = state.selected_mode === "fixed_resistance";
+        const sweepSelected = state.selected_mode === "sweep";
+        const canConfigure = Boolean(state.safety_config_complete) && !state.active_mode;
+        const canStep = Boolean(state.safety_config_complete) && state.sweep_state !== "running";
+        const canEnable = fixedSelected && canConfigure;
+        const canApply = state.active_mode === "fixed_resistance" && state.input_enabled;
+        const canSweep = sweepSelected && canConfigure;
+        const canStop = Boolean(state.active_mode || state.input_enabled || state.sweep_state === "running");
+        const canClearFault = state.safety_state === "safety_fault" || state.safety_state === "instrument_error";
+        const messageClass = state.safety_state === "safety_fault" || state.safety_state === "instrument_error" || !state.safety_config_complete
+          ? "load-message load-message-error"
+          : "load-message";
+        return `
+          <details data-detail-key="${escapeHtml(detailKey(uid, "load"))}">
+            <summary><span class="load-summary"><span>Load</span><span>Electronic Load · ET5406A+ · ${escapeHtml(status)}</span></span></summary>
+            <div class="load-controls" data-load-uid="${escapeHtml(loadUid)}">
+              <div class="wifi-detail-grid">
+                ${detailRow("Type", "Electronic Load")}
+                ${detailRow("Device", state.device || "ET5406A+")}
+                ${detailRow("UID", loadUid)}
+                ${detailRow("Status", state.safety_state)}
+                ${detailRow("Selected mode", state.selected_mode)}
+                ${detailRow("Active mode", state.active_mode || "None")}
+                ${detailRow("Input", state.input_enabled ? "Enabled" : "OFF")}
+                ${detailRow("Setpoint", formatResistanceKohm(state.resistance_setpoint_ohm))}
+                ${detailRow("Measured/effective R", state.last_measurement?.load_resistance_ohm == null ? null : `${state.last_measurement.load_resistance_ohm.toFixed(2)} ohm`)}
+                ${detailRow("Sweep", state.sweep_state)}
+              </div>
+              <div class="load-mode-buttons">
+                <button type="button" data-load-action="select-fixed" data-load-uid="${escapeHtml(loadUid)}" class="${fixedSelected ? "load-mode-selected" : ""}" ${canConfigure ? "" : "disabled"}>Fixed Resistance</button>
+                <button type="button" data-load-action="select-sweep" data-load-uid="${escapeHtml(loadUid)}" class="${sweepSelected ? "load-mode-selected" : ""}" ${canConfigure ? "" : "disabled"}>Sweep</button>
+              </div>
+              ${fixedSelected ? `
+                <div class="digit-stepper-wrap" aria-label="Fixed resistance digit stepper">
+                  <div class="digit-stepper">
+                    ${[1000, 100, 10].map(step => `<button type="button" data-load-action="step" data-direction="1" data-step-ohm="${step}" data-load-uid="${escapeHtml(loadUid)}" ${canStep ? "" : "disabled"}>▲</button>`).join("")}
+                  </div>
+                  <div class="digit-value">${escapeHtml(formatResistanceKohm(state.resistance_setpoint_ohm))}</div>
+                  <div class="digit-stepper">
+                    ${[1000, 100, 10].map(step => `<button type="button" data-load-action="step" data-direction="-1" data-step-ohm="${step}" data-load-uid="${escapeHtml(loadUid)}" ${canStep ? "" : "disabled"}>▼</button>`).join("")}
+                  </div>
+                </div>
+                <div class="load-actions">
+                  <button type="button" data-load-action="enable-fixed" data-load-uid="${escapeHtml(loadUid)}" ${canEnable ? "" : "disabled"}>Enable Fixed Load</button>
+                  <button type="button" data-load-action="apply-fixed" data-load-uid="${escapeHtml(loadUid)}" ${canApply ? "" : "disabled"}>Apply</button>
+                  <button type="button" class="load-stop" data-load-action="disable" data-load-uid="${escapeHtml(loadUid)}" ${canStop ? "" : "disabled"}>Stop / Disable</button>
+                  <button type="button" data-load-action="clear-fault" data-load-uid="${escapeHtml(loadUid)}" ${canClearFault ? "" : "disabled"}>Clear Latched Fault</button>
+                </div>
+              ` : `
+                <div class="load-actions">
+                  <button type="button" data-load-action="start-sweep" data-load-uid="${escapeHtml(loadUid)}" ${canSweep ? "" : "disabled"}>Start Sweep</button>
+                  <button type="button" class="load-stop" data-load-action="disable" data-load-uid="${escapeHtml(loadUid)}" ${canStop ? "" : "disabled"}>Stop / Disable</button>
+                  <button type="button" data-load-action="clear-fault" data-load-uid="${escapeHtml(loadUid)}" ${canClearFault ? "" : "disabled"}>Clear Latched Fault</button>
+                </div>
+              `}
+              <div class="${messageClass}">${escapeHtml(state.safety_message || "")}</div>
+            </div>
+          </details>
+        `;
+      }
+
+      async function loadAction(uid, action, element) {
+        let path;
+        let payload = {};
+        if (action === "select-fixed" || action === "select-sweep") {
+          path = `/loads/${encodeURIComponent(uid)}/select`;
+          payload.mode = action === "select-fixed" ? "fixed_resistance" : "sweep";
+        } else if (action === "step") {
+          path = `/loads/${encodeURIComponent(uid)}/step`;
+          payload = { step_ohm: Number(element.dataset.stepOhm), direction: Number(element.dataset.direction) };
+        } else if (action === "enable-fixed") {
+          path = `/loads/${encodeURIComponent(uid)}/fixed/enable`;
+        } else if (action === "apply-fixed") {
+          path = `/loads/${encodeURIComponent(uid)}/fixed/apply`;
+        } else if (action === "start-sweep") {
+          path = `/loads/${encodeURIComponent(uid)}/sweep/start`;
+        } else if (action === "disable" || action === "clear-fault") {
+          path = `/loads/${encodeURIComponent(uid)}/disable`;
+          payload.clear_fault = action === "clear-fault";
+        }
+        if (!path) return;
+        const response = await fetch(path, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.error || "Load control failed");
+        await refreshWifiNodes();
+      }
+
       function captureSolarDetailOpenState() {
         wifiNodeListEl.querySelectorAll("details[data-detail-key]").forEach((detail) => {
           const key = detail.dataset.detailKey;
@@ -749,8 +960,9 @@
         });
       }
 
-      function renderWifiNodes(readings) {
+      function renderWifiNodes(readings, loadStates) {
         captureSolarDetailOpenState();
+        loadStatesByUid = new Map((loadStates || []).map(load => [load.uid, load]));
         const cards = mergeSolarNodes(readings);
         if (!cards.length) {
           wifiNodeListEl.innerHTML = '<section class="card chart-panel wifi-card"><div class="reading">No BardBox solar node readings yet.</div></section>';
@@ -770,6 +982,8 @@
           const uid = configured.uid || reading?.uid || "Unknown UID";
           const timestamp = reading?.timestamp ? new Date(reading.timestamp).toLocaleString() : "—";
           const panelVoltages = state === "LIVE" ? getPanelVoltages(data) : [null, null, null, null];
+          const configuredLoad = configured.load || null;
+          const load = configuredLoad ? loadStatesByUid.get(configuredLoad.uid) : null;
           const errorMarkup = error ? `<div class="time-message">${escapeHtml(error)}</div>` : "";
 
           return `
@@ -817,8 +1031,10 @@
                         <div class="panel-voltage-value">${escapeHtml(formatVoltage(value))}</div>
                       </div>
                     `).join("")}
+                    ${load?.last_measurement ? `${detailRow("Voltage", `${load.last_measurement.voltage_v.toFixed(3)} V`)}${detailRow("Current", `${load.last_measurement.current_a.toFixed(3)} A`)}${detailRow("Power", `${load.last_measurement.power_w.toFixed(3)} W`)}` : ""}
                   </div>
                 </details>
+                ${loadFoldout(uid, configuredLoad, load)}
               </div>
               ${errorMarkup}
             </section>
@@ -848,9 +1064,10 @@
       }
 
       async function refreshWifiNodes() {
-        const response = await fetch("/readings/latest");
-        const payload = await response.json();
-        renderWifiNodes(Array.isArray(payload.readings) ? payload.readings : []);
+        const [readingsResponse, loadsResponse] = await Promise.all([fetch("/readings/latest"), fetch("/loads")]);
+        const readingsPayload = await readingsResponse.json();
+        const loadsPayload = await loadsResponse.json();
+        renderWifiNodes(Array.isArray(readingsPayload.readings) ? readingsPayload.readings : [], Array.isArray(loadsPayload.loads) ? loadsPayload.loads : []);
       }
 
       async function refreshTime() {
@@ -866,6 +1083,15 @@
 
       document.getElementById("stop-button").addEventListener("click", () => {
         setRunActive(false).catch(console.error);
+      });
+
+      wifiNodeListEl.addEventListener("click", (event) => {
+        const button = event.target.closest("button[data-load-action]");
+        if (!button || button.disabled) return;
+        loadAction(button.dataset.loadUid, button.dataset.loadAction, button).catch((error) => {
+          console.error(error);
+          window.alert(error.message);
+        });
       });
 
       refreshState().catch(console.error);

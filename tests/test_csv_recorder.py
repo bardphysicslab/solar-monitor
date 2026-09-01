@@ -228,7 +228,14 @@ class CsvRecorderTest(unittest.TestCase):
                             "power_w": power,
                             "load_resistance_ohm": resistance,
                         },
-                        "extended": {},
+                        "extended": {
+                            "panel_uid": "bb-solar-pnl-001",
+                            "load_uid": "yertai-et5406a-plus-001",
+                            "load_type": "electronic_load",
+                            "active_mode": "fixed_resistance",
+                            "resistance_setpoint_ohm": 800,
+                            "safety_state": "active",
+                        },
                         "raw": None,
                     },
                 )
@@ -240,6 +247,12 @@ class CsvRecorderTest(unittest.TestCase):
             self.assertEqual(row["current_a"], "0.0200")
             self.assertEqual(row["power_w"], "0.3220")
             self.assertEqual(row["load_resistance_ohm"], "801.0000")
+            self.assertEqual(row["panel_uid"], "bb-solar-pnl-001")
+            self.assertEqual(row["load_uid"], "yertai-et5406a-plus-001")
+            self.assertEqual(row["load_type"], "electronic_load")
+            self.assertEqual(row["active_mode"], "fixed_resistance")
+            self.assertEqual(row["resistance_setpoint_ohm"], "800.0000")
+            self.assertEqual(row["safety_state"], "active")
             self.assertNotIn("panel_voltage_1_v", row)
 
     def test_solar_window_maps_single_channel_and_blanks_missing_values(self):

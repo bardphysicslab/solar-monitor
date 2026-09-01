@@ -34,6 +34,12 @@ ET54_HEADER = [
     "current_a",
     "power_w",
     "load_resistance_ohm",
+    "panel_uid",
+    "load_uid",
+    "load_type",
+    "active_mode",
+    "resistance_setpoint_ohm",
+    "safety_state",
 ]
 
 SOLAR_HEADER = [
@@ -317,6 +323,14 @@ class CsvAveragingRecorder:
             window.add_numeric("current_a", data.get("current_a"))
             window.add_numeric("power_w", data.get("power_w"))
             window.add_numeric("load_resistance_ohm", data.get("load_resistance_ohm"))
+            window.latest_strings = {
+                "panel_uid": extended.get("panel_uid"),
+                "load_uid": extended.get("load_uid"),
+                "load_type": extended.get("load_type"),
+                "active_mode": extended.get("active_mode"),
+                "safety_state": extended.get("safety_state"),
+            }
+            window.add_numeric("resistance_setpoint_ohm", extended.get("resistance_setpoint_ohm"))
             return
 
         panel_1 = data.get("panel_voltage_1_v")
@@ -383,6 +397,12 @@ class CsvAveragingRecorder:
                     "current_a": self._format_mean(window, "current_a", 4),
                     "power_w": self._format_mean(window, "power_w", 4),
                     "load_resistance_ohm": self._format_mean(window, "load_resistance_ohm", 4),
+                    "panel_uid": (getattr(window, "latest_strings", {}) or {}).get("panel_uid") or "",
+                    "load_uid": (getattr(window, "latest_strings", {}) or {}).get("load_uid") or "",
+                    "load_type": (getattr(window, "latest_strings", {}) or {}).get("load_type") or "",
+                    "active_mode": (getattr(window, "latest_strings", {}) or {}).get("active_mode") or "",
+                    "resistance_setpoint_ohm": self._format_mean(window, "resistance_setpoint_ohm", 4),
+                    "safety_state": (getattr(window, "latest_strings", {}) or {}).get("safety_state") or "",
                 }
             )
             return base

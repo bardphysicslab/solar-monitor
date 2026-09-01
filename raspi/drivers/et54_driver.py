@@ -1,3 +1,4 @@
+from contextlib import contextmanager
 from datetime import datetime, timezone
 import math
 import threading
@@ -88,12 +89,26 @@ class ET54Driver:
                 "input_control": True,
                 "resistance_sweep": True,
             },
+            "limits": {
+                "absolute": {
+                    "max_voltage_v": 120.0,
+                    "max_current_a": 20.0,
+                    "max_power_w": 200.0,
+                    "min_load_resistance_ohm": 0.05,
+                    "max_load_resistance_ohm": 4500.0,
+                }
+            },
             "raw_available": True,
         }
 
     def close(self) -> None:
         with self._lock:
             self._close()
+
+    @contextmanager
+    def operation(self):
+        with self._lock:
+            yield self
 
     def identify(self) -> str:
         return self._query("*IDN?")

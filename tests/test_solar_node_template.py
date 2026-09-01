@@ -68,6 +68,43 @@ class SolarNodeTemplateTest(unittest.TestCase):
         self.assertIn("captureSolarDetailOpenState();", TEMPLATE)
         self.assertIn("restoreSolarDetailOpenState();", TEMPLATE)
 
+    def test_load_is_embedded_in_panel_card_and_unassigned_panels_are_supported(self):
+        self.assertIn("const configuredLoad = configured.load || null;", TEMPLATE)
+        self.assertIn("loadFoldout(uid, configuredLoad, load)", TEMPLATE)
+        self.assertIn("No load is explicitly associated with this panel.", TEMPLATE)
+        self.assertIn("Electronic Load · ET5406A+", TEMPLATE)
+        self.assertNotIn("ET54 Nodes", TEMPLATE)
+
+    def test_selected_mode_is_distinct_from_active_mode_and_activation_is_explicit(self):
+        self.assertIn('state.selected_mode === "fixed_resistance"', TEMPLATE)
+        self.assertIn('state.active_mode === "fixed_resistance"', TEMPLATE)
+        self.assertIn('data-load-action="select-fixed"', TEMPLATE)
+        self.assertIn('data-load-action="enable-fixed"', TEMPLATE)
+        self.assertIn('data-load-action="apply-fixed"', TEMPLATE)
+        self.assertIn('data-load-action="start-sweep"', TEMPLATE)
+        self.assertIn('data-load-action="disable"', TEMPLATE)
+        self.assertIn('data-load-action="clear-fault"', TEMPLATE)
+        self.assertIn("Stop / Disable", TEMPLATE)
+
+    def test_manual_cr_digit_stepper_uses_three_safe_server_validated_steps(self):
+        self.assertIn("formatResistanceKohm", TEMPLATE)
+        self.assertIn(".toFixed(2)", TEMPLATE)
+        self.assertIn("[1000, 100, 10]", TEMPLATE)
+        self.assertIn('data-load-action="step"', TEMPLATE)
+        self.assertIn("/step`", TEMPLATE)
+        self.assertNotIn("4500", TEMPLATE)
+
+    def test_load_scientific_readings_and_safety_state_are_present(self):
+        for text in (
+            'detailRow("Voltage"',
+            'detailRow("Current"',
+            'detailRow("Power"',
+            'detailRow("Setpoint"',
+            'detailRow("Measured/effective R"',
+            'detailRow("Status"',
+        ):
+            self.assertIn(text, TEMPLATE)
+
 
 if __name__ == "__main__":
     unittest.main()
