@@ -5,7 +5,7 @@ import statistics
 import threading
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, ContextManager, Dict, Iterable, List, Optional, Protocol
 
 
@@ -152,6 +152,8 @@ class ElectronicLoadController:
         irradiance_provider: Optional[Callable[[str, str], Iterable[float]]] = None,
         sweep_result_sink: Optional[Callable[[Dict[str, Any]], None]] = None,
         sleep_fn: Callable[[float], None] = time.sleep,
+        monotonic_fn: Callable[[], float] = time.monotonic,
+        wait_fn: Optional[Callable[[float], bool]] = None,
     ):
         self.driver = driver
         self.uid = driver.uid
@@ -162,11 +164,13 @@ class ElectronicLoadController:
         self.irradiance_provider = irradiance_provider or (lambda _start, _end: [])
         self.sweep_result_sink = sweep_result_sink
         self.sleep_fn = sleep_fn
+        self.monotonic_fn = monotonic_fn
         self._lock = threading.RLock()
         self.selected_mode = load_config.get("default_selected_mode", "fixed_resistance")
         self.selected_resistance_ohm = float(
             (load_config.get("cr") or {}).get("default_resistance_ohm", load_config.get("resistance_ohm", 100))
         )
+        self.applied_resistance_ohm = None
         self.active_mode = None
         self.input_enabled = False
         self.safety_state = "disabled"
@@ -175,6 +179,12 @@ class ElectronicLoadController:
         self.last_sweep = None
         self.last_measurement = None
         self._stop_requested = threading.Event()
+        self.wait_fn = wait_fn or self._stop_requested.wait
+        self.sweep_run_mode = "single_shot"
+        self.sweep_run_active = False
+        self._sweep_durations: List[float] = []
+        self.overrun_count = 0
+        self.skipped_boundary_count = 0
         self._refresh_readiness()
 
     def _refresh_readiness(self) -> None:
@@ -209,6 +219,15 @@ class ElectronicLoadController:
                 envelope = None
                 config_complete = False
                 config_error = str(exc)
+            try:
+                _sweep_envelope, sweep_values, sweep_settle_s = self.validate_sweep_configuration()
+                sweep_config_valid = True
+                sweep_config_error = None
+            except LoadControlError as exc:
+                sweep_values = []
+                sweep_settle_s = numeric((self.config.get("sweep") or {}).get("settle_s"))
+                sweep_config_valid = False
+                sweep_config_error = str(exc)
             return {
                 "uid": self.uid,
                 "panel_uid": self.panel_uid,
@@ -220,12 +239,26 @@ class ElectronicLoadController:
                 "safety_state": self.safety_state,
                 "safety_message": self.safety_message,
                 "resistance_setpoint_ohm": self.selected_resistance_ohm,
+                "applied_resistance_ohm": self.applied_resistance_ohm,
                 "sweep_state": self.sweep_state,
+                "sweep_run_mode": self.sweep_run_mode,
+                "sweep_run_active": self.sweep_run_active,
+                "sweep_timing_stats": self.sweep_timing_stats(),
                 "last_measurement": self.last_measurement,
                 "last_sweep": self.last_sweep,
                 "safety_config_complete": config_complete,
                 "safety_config_error": config_error,
                 "effective_limits": envelope,
+                "sweep_config": {
+                    "resistance_values_ohm": sweep_values,
+                    "point_count": len(sweep_values),
+                    "min_resistance_ohm": min(sweep_values) if sweep_values else None,
+                    "max_resistance_ohm": max(sweep_values) if sweep_values else None,
+                    "settle_s": sweep_settle_s,
+                    "interval_s": numeric((self.config.get("sweep") or {}).get("interval_s")),
+                    "valid": sweep_config_valid,
+                    "error": sweep_config_error,
+                },
             }
 
     def select_mode(self, mode: str, resistance_ohm: Optional[float] = None) -> Dict[str, Any]:
@@ -240,6 +273,43 @@ class ElectronicLoadController:
                 self.selected_resistance_ohm = float(resistance_ohm)
             self._refresh_readiness()
             return self.state()
+
+    def select_sweep_run_mode(self, run_mode: str) -> Dict[str, Any]:
+        if run_mode not in {"single_shot", "continuous"}:
+            raise LoadControlError(f"Unsupported sweep run mode: {run_mode}")
+        with self._lock:
+            if self.sweep_run_active or self.sweep_state == "running" or self.active_mode is not None:
+                raise LoadControlError("Cannot change sweep run mode while a load operation is active")
+            self.sweep_run_mode = run_mode
+            return self.state()
+
+    def sweep_timing_stats(self) -> Dict[str, Any]:
+        durations = list(self._sweep_durations)
+        if not durations:
+            return {
+                "completed_sweep_count": 0,
+                "last_duration_s": None,
+                "min_duration_s": None,
+                "max_duration_s": None,
+                "mean_duration_s": None,
+                "median_duration_s": None,
+                "p95_duration_s": None,
+                "overrun_count": self.overrun_count,
+                "skipped_boundary_count": self.skipped_boundary_count,
+            }
+        ordered = sorted(durations)
+        p95_index = max(0, math.ceil(0.95 * len(ordered)) - 1)
+        return {
+            "completed_sweep_count": len(durations),
+            "last_duration_s": durations[-1],
+            "min_duration_s": ordered[0],
+            "max_duration_s": ordered[-1],
+            "mean_duration_s": statistics.fmean(durations),
+            "median_duration_s": statistics.median(durations),
+            "p95_duration_s": ordered[p95_index],
+            "overrun_count": self.overrun_count,
+            "skipped_boundary_count": self.skipped_boundary_count,
+        }
 
     def select_resistance_step(self, step_ohm: float, direction: int) -> Dict[str, Any]:
         with self._lock:
@@ -281,6 +351,7 @@ class ElectronicLoadController:
                 raise
             self.active_mode = "fixed_resistance"
             self.input_enabled = True
+            self.applied_resistance_ohm = self.selected_resistance_ohm
             self.safety_state = "active"
             self.safety_message = "Fixed resistance load active"
             self.last_measurement = measurement
@@ -305,12 +376,15 @@ class ElectronicLoadController:
                 self._latch_fault("safety_fault" if isinstance(exc, SafetyViolation) else "instrument_error", str(exc))
                 raise
             self.last_measurement = measurement
+            self.applied_resistance_ohm = self.selected_resistance_ohm
             return self.state()
 
     def disable(self, clear_fault: bool = False) -> Dict[str, Any]:
         with self._lock:
             self._stop_requested.set()
-            if self.input_enabled or self.active_mode is not None or self.sweep_state == "running":
+            was_sweep_run_active = self.sweep_run_active
+            self.sweep_run_active = False
+            if self.input_enabled or self.active_mode is not None or self.sweep_state == "running" or was_sweep_run_active:
                 self._safe_off()
             self.active_mode = None
             self.input_enabled = False
@@ -370,7 +444,13 @@ class ElectronicLoadController:
             raise SafetyConfigurationError("sweep.settle_s must be a non-negative number")
         return envelope, values, settle_s
 
-    def run_sweep(self) -> Dict[str, Any]:
+    def run_sweep(
+        self,
+        scheduled_start_at: Optional[str] = None,
+        scheduled_monotonic: Optional[float] = None,
+        cadence_s: Optional[float] = None,
+        preserve_stop_request: bool = False,
+    ) -> Dict[str, Any]:
         with self._lock:
             if self.active_mode is not None or self.safety_state in {"safety_fault", "instrument_error"}:
                 raise LoadControlError("Load must be disabled and fault-cleared before sweep")
@@ -381,12 +461,16 @@ class ElectronicLoadController:
             self.sweep_state = "running"
             self.safety_state = "sweep_running"
             self.safety_message = "Sweep running"
-            self._stop_requested.clear()
+            if not preserve_stop_request:
+                self._stop_requested.clear()
 
         sweep_id = str(uuid.uuid4())
-        started_at = utc_timestamp()
+        actual_started_at = utc_timestamp()
+        started_monotonic = self.monotonic_fn()
+        scheduled_monotonic = started_monotonic if scheduled_monotonic is None else scheduled_monotonic
+        scheduled_start_at = scheduled_start_at or actual_started_at
         points: List[Dict[str, Any]] = []
-        quality = "valid"
+        electrical_status = "complete"
         reason = None
         previous = None
         try:
@@ -409,7 +493,7 @@ class ElectronicLoadController:
                     self._validate_resistance(value, envelope=envelope)
                     self.driver.set_resistance(value)
                     if settle_s:
-                        if self._stop_requested.wait(settle_s):
+                        if self.wait_fn(settle_s):
                             raise OperationStopped("Sweep stopped by user")
                     measurement = self.driver.measure_all()
                     point = {
@@ -421,33 +505,49 @@ class ElectronicLoadController:
                     self._validate_measurement(measurement, envelope)
                     previous = measurement
         except SafetyViolation as exc:
-            quality = "safety_abort"
+            electrical_status = "safety_abort"
             reason = str(exc)
         except OperationStopped as exc:
-            quality = "incomplete"
+            electrical_status = "incomplete"
             reason = str(exc)
         except Exception as exc:
-            quality = "instrument_error"
+            electrical_status = "instrument_error"
             reason = str(exc)
         finally:
             try:
                 self.driver.input_off()
             except Exception as exc:
                 if reason is None:
-                    quality = "instrument_error"
+                    electrical_status = "instrument_error"
                     reason = f"Could not confirm input OFF: {exc}"
 
         completed_at = utc_timestamp()
-        irradiance = self._irradiance_statistics(started_at, completed_at)
-        if quality == "valid" and not points:
-            quality = "incomplete"
-            reason = "Sweep produced no measurement points"
-        if quality == "valid" and irradiance["count"] == 0:
-            quality = "incomplete"
-            reason = "No SPN1 irradiance samples were captured during sweep"
-        if quality == "valid" and self._irradiance_unstable(irradiance):
-            quality = "unstable_irradiance"
-            reason = "Irradiance changed beyond configured quality thresholds"
+        completed_monotonic = self.monotonic_fn()
+        duration_s = max(0.0, completed_monotonic - started_monotonic)
+        irradiance = self._irradiance_statistics(actual_started_at, completed_at)
+        if electrical_status == "complete" and len(points) != len(values):
+            electrical_status = "incomplete"
+            reason = f"Sweep completed {len(points)}/{len(values)} electrical points"
+        if irradiance["count"] == 0:
+            irradiance_status = "unavailable"
+        elif self._irradiance_unstable(irradiance):
+            irradiance_status = "unstable"
+        else:
+            irradiance_status = "valid"
+        if electrical_status == "complete":
+            quality = {
+                "valid": "valid",
+                "unstable": "unstable_irradiance",
+                "unavailable": "irradiance_unavailable",
+            }[irradiance_status]
+        else:
+            quality = electrical_status
+        if electrical_status in {"incomplete", "safety_abort", "instrument_error"}:
+            timing_status = electrical_status
+        elif cadence_s is not None and completed_monotonic > scheduled_monotonic + cadence_s:
+            timing_status = "overrun"
+        else:
+            timing_status = "on_time"
 
         mpp_point = max(points, key=lambda point: point["voltage_v"] * point["current_a"]) if points else None
         result = {
@@ -456,8 +556,14 @@ class ElectronicLoadController:
             "load_uid": self.uid,
             "load_type": self.load_type,
             "active_mode": "sweep",
-            "started_at": started_at,
+            "scheduled_start_at": scheduled_start_at,
+            "actual_started_at": actual_started_at,
+            "started_at": actual_started_at,
             "completed_at": completed_at,
+            "duration_s": duration_s,
+            "timing_status": timing_status,
+            "electrical_status": electrical_status,
+            "irradiance_status": irradiance_status,
             "quality": quality,
             "reason": reason,
             "points": points,
@@ -469,19 +575,86 @@ class ElectronicLoadController:
         }
         with self._lock:
             self.last_sweep = result
+            if electrical_status == "complete":
+                self._sweep_durations.append(duration_s)
+                if timing_status == "overrun":
+                    self.overrun_count += 1
             self.active_mode = None
             self.input_enabled = False
-            self.sweep_state = "completed" if quality in {"valid", "unstable_irradiance"} else "aborted"
-            if quality == "safety_abort":
+            self.sweep_state = "completed" if electrical_status == "complete" else "aborted"
+            if electrical_status == "safety_abort":
                 self._latch_fault("safety_fault", reason or "Sweep safety abort")
-            elif quality == "instrument_error":
+            elif electrical_status == "instrument_error":
                 self._latch_fault("instrument_error", reason or "Sweep instrument error")
             else:
                 self.safety_state = "ready"
-                self.safety_message = reason or "Sweep completed"
+                self.safety_message = reason or "Electrical sweep completed"
         if self.sweep_result_sink:
             self.sweep_result_sink(result)
         return result
+
+    def run_sweep_sequence(self, run_mode: Optional[str] = None) -> List[Dict[str, Any]]:
+        selected_run_mode = run_mode or self.sweep_run_mode
+        if selected_run_mode not in {"single_shot", "continuous"}:
+            raise LoadControlError(f"Unsupported sweep run mode: {selected_run_mode}")
+        interval_s = numeric((self.config.get("sweep") or {}).get("interval_s"))
+        if interval_s is None or interval_s <= 0:
+            raise SafetyConfigurationError("sweep.interval_s must be a positive number")
+        self.validate_sweep_configuration()
+        with self._lock:
+            if self.sweep_run_active or self.active_mode is not None:
+                raise LoadControlError("Sweep run already active")
+            self.sweep_run_mode = selected_run_mode
+            self.sweep_run_active = True
+            self._stop_requested.clear()
+
+        results: List[Dict[str, Any]] = []
+        cadence_origin = self.monotonic_fn()
+        cadence_origin_wall = datetime.now(timezone.utc)
+        boundary_index = 0
+        try:
+            while not self._stop_requested.is_set():
+                scheduled_monotonic = cadence_origin + boundary_index * interval_s
+                wait_s = max(0.0, scheduled_monotonic - self.monotonic_fn())
+                if wait_s and self.wait_fn(wait_s):
+                    break
+                result = self.run_sweep(
+                    scheduled_start_at=(cadence_origin_wall + timedelta(seconds=boundary_index * interval_s)).strftime(
+                        "%Y-%m-%dT%H:%M:%SZ"
+                    ),
+                    scheduled_monotonic=scheduled_monotonic,
+                    cadence_s=interval_s,
+                    preserve_stop_request=True,
+                )
+                results.append(result)
+                if selected_run_mode == "single_shot":
+                    break
+                if result["electrical_status"] in {"safety_abort", "instrument_error"}:
+                    break
+                if self._stop_requested.is_set():
+                    break
+
+                next_index = boundary_index + 1
+                now = self.monotonic_fn()
+                while cadence_origin + next_index * interval_s < now:
+                    next_index += 1
+                skipped = max(0, next_index - boundary_index - 1)
+                with self._lock:
+                    self.skipped_boundary_count += skipped
+                boundary_index = next_index
+        finally:
+            try:
+                self.driver.input_off()
+            except Exception as exc:
+                with self._lock:
+                    if self.safety_state != "safety_fault":
+                        self._latch_fault("instrument_error", f"Could not confirm input OFF: {exc}")
+            finally:
+                with self._lock:
+                    self.input_enabled = False
+                    self.active_mode = None
+                    self.sweep_run_active = False
+        return results
 
     def _validate_resistance(self, value: float, mode: Optional[str] = None, envelope: Optional[Dict[str, float]] = None) -> None:
         limits = envelope or self.safety_envelope(mode or self.selected_mode)

@@ -519,6 +519,9 @@ def configured_wifi_nodes(config: Dict[str, Any]) -> List[Dict[str, Any]]:
         load = loads_by_panel.get(entry.get("uid"))
         if load is not None:
             node["load"] = load
+            node["source_location"] = "local"
+        else:
+            node["source_location"] = "network"
         nodes.append(node)
     return nodes
 
@@ -732,16 +735,25 @@ async def disable_load(uid: str, request: Request):
 @app.post("/loads/{uid}/sweep/start")
 def start_load_sweep(uid: str):
     controller = get_load_controller(uid)
-    if controller.state()["sweep_state"] == "running":
+    if controller.state()["sweep_run_active"]:
         return load_error_response(LoadControlError("Sweep already running"))
     try:
         controller.validate_sweep_configuration()
     except LoadControlError as exc:
         return load_error_response(exc)
-    thread = threading.Thread(target=controller.run_sweep, daemon=True)
+    thread = threading.Thread(target=controller.run_sweep_sequence, daemon=True)
     sweep_threads[uid] = thread
     thread.start()
     return JSONResponse(controller.state(), status_code=202)
+
+
+@app.post("/loads/{uid}/sweep/run-mode")
+async def select_sweep_run_mode(uid: str, request: Request):
+    payload = await request.json()
+    try:
+        return JSONResponse(get_load_controller(uid).select_sweep_run_mode(payload.get("run_mode")))
+    except Exception as exc:
+        return load_error_response(exc)
 
 
 @app.post("/start")

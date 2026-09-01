@@ -146,6 +146,7 @@ class MainMultiDeviceTest(unittest.TestCase):
                     "driver": "wifi_node",
                     "host": "192.0.2.10",
                     "port": 1234,
+                    "source_location": "network",
                 }
             ],
         )
@@ -248,7 +249,9 @@ class MainMultiDeviceTest(unittest.TestCase):
         by_uid = {node["uid"]: node for node in nodes}
         self.assertEqual(by_uid["panel-001"]["load"]["uid"], "load-001")
         self.assertEqual(by_uid["panel-001"]["load"]["load_type"], "electronic_load")
+        self.assertEqual(by_uid["panel-001"]["source_location"], "local")
         self.assertNotIn("load", by_uid["panel-002"])
+        self.assertEqual(by_uid["panel-002"]["source_location"], "network")
 
     def test_running_sweep_is_skipped_without_blocking_other_generic_drivers(self):
         class RunningController:
@@ -276,7 +279,7 @@ class MainMultiDeviceTest(unittest.TestCase):
     def test_unsafe_sweep_is_rejected_before_background_thread_starts(self):
         class UnsafeController:
             def state(self):
-                return {"sweep_state": "idle"}
+                return {"sweep_state": "idle", "sweep_run_active": False}
 
             def validate_sweep_configuration(self):
                 raise main.LoadControlError("panel operating limits are required")

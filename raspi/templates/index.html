@@ -421,6 +421,58 @@
         color: #ff9da3;
       }
 
+      .sweep-result {
+        display: grid;
+        gap: 8px;
+        border-top: 1px solid rgba(255, 255, 255, 0.07);
+        padding-top: 10px;
+      }
+
+      .sweep-result-title {
+        margin: 0;
+        font-size: 13px;
+      }
+
+      .sweep-curve {
+        width: 100%;
+        min-height: 190px;
+        overflow: visible;
+      }
+
+      .sweep-curve-axis {
+        stroke: rgba(255, 255, 255, 0.34);
+        stroke-width: 1;
+      }
+
+      .sweep-curve-line {
+        fill: none;
+        stroke: var(--accent);
+        stroke-width: 2;
+      }
+
+      .sweep-curve-point {
+        fill: var(--accent);
+        stroke: #111;
+        stroke-width: 2;
+        cursor: pointer;
+      }
+
+      .sweep-curve-point-mpp {
+        fill: var(--accent-2);
+        stroke: #fff;
+        stroke-width: 3;
+      }
+
+      .sweep-curve-label,
+      .sweep-point-detail {
+        color: var(--muted);
+        font-size: 11px;
+      }
+
+      .sweep-point-detail {
+        min-height: 1.4em;
+      }
+
       .load-active {
         color: var(--accent-2);
       }
@@ -567,12 +619,7 @@
       const clockUtcEl = document.getElementById("clock-utc");
       const sunValueEl = document.getElementById("sun-value");
       const wifiNodeListEl = document.getElementById("wifi-node-list");
-      const expectedSolarNodeUids = [
-        "bb-solar-pnl-001",
-        "bb-solar-pnl-002",
-        "bb-solar-pnl-003",
-        "bb-solar-pnl-004",
-      ];
+      const expectedSolarNodeUids = configuredSolarNodes.map(node => node.uid).filter(Boolean);
       const openSolarDetails = new Set();
       let loadStatesByUid = new Map();
       let lastSpn1Timestamp = null;
@@ -740,13 +787,13 @@
         return "—";
       }
 
-      function getPanelVoltages(data) {
-        return [
-          data.panel_voltage_1_v ?? data.panel_voltage_v ?? null,
-          data.panel_voltage_2_v ?? null,
-          data.panel_voltage_3_v ?? null,
-          data.panel_voltage_4_v ?? null,
-        ];
+      function panelReadingValues(data, load) {
+        const measurement = load?.last_measurement || {};
+        return {
+          voltage_v: measurement.voltage_v ?? data.voltage_v ?? data.panel_voltage_v ?? null,
+          current_a: measurement.current_a ?? data.current_a ?? null,
+          power_w: measurement.power_w ?? data.power_w ?? null,
+        };
       }
 
       function mergeSolarNodes(readings) {
@@ -801,16 +848,70 @@
         `;
       }
 
+      function optionalDetailRow(label, value) {
+        return value === null || value === undefined || value === "" ? "" : detailRow(label, value);
+      }
+
       function detailKey(uid, section) {
         return `${uid}:${section}`;
       }
 
       function formatResistanceKohm(valueOhm) {
-        return typeof valueOhm === "number" ? `${(valueOhm / 1000).toFixed(2)} kOhm` : "--.-- kOhm";
+        return typeof valueOhm === "number" ? `${(valueOhm / 1000).toFixed(2)} kΩ` : "--.-- kΩ";
+      }
+
+      function formatResistance(valueOhm) {
+        if (typeof valueOhm !== "number" || !Number.isFinite(valueOhm)) return "—";
+        return valueOhm >= 1000 ? `${(valueOhm / 1000).toFixed(2)} kΩ` : `${valueOhm.toFixed(1)} Ω`;
+      }
+
+      function formatNumber(value, digits, suffix) {
+        return typeof value === "number" && Number.isFinite(value) ? `${value.toFixed(digits)}${suffix}` : "—";
+      }
+
+      function sweepCurveMarkup(loadUid, sweep) {
+        const points = Array.isArray(sweep?.points) ? sweep.points : [];
+        if (!points.length) return "";
+        const plotted = points.map((point, index) => ({
+          point,
+          index,
+          resistance: Number(point.resistance_setpoint_ohm),
+          power: Number(point.power_w),
+          calculatedPower: Number(point.voltage_v) * Number(point.current_a),
+        })).filter(item => Number.isFinite(item.resistance) && Number.isFinite(item.power));
+        if (!plotted.length) return "";
+        const minR = Math.min(...plotted.map(item => item.resistance));
+        const maxR = Math.max(...plotted.map(item => item.resistance));
+        const maxPower = Math.max(...plotted.map(item => item.power), 0.001);
+        const x = value => 42 + ((value - minR) / Math.max(maxR - minR, 1)) * 286;
+        const y = value => 150 - (value / maxPower) * 120;
+        const mpp = plotted.reduce((best, item) => item.calculatedPower > best.calculatedPower ? item : best, plotted[0]);
+        const line = plotted.map(item => `${x(item.resistance)},${y(item.power)}`).join(" ");
+        const circles = plotted.map(item => `
+          <circle class="sweep-curve-point ${item.index === mpp.index ? "sweep-curve-point-mpp" : ""}"
+            cx="${x(item.resistance)}" cy="${y(item.power)}" r="${item.index === mpp.index ? 6 : 4}"
+            tabindex="0" role="button" data-sweep-point data-load-uid="${escapeHtml(loadUid)}" data-point-index="${item.index}">
+            <title>${escapeHtml(`R ${item.resistance} ohm, P ${item.power.toFixed(3)} W${item.index === mpp.index ? ", MPP" : ""}`)}</title>
+          </circle>`).join("");
+        return `
+          <details class="sweep-result" data-detail-key="${escapeHtml(detailKey(loadUid, "sweep-curve"))}">
+            <summary>View Sweep Curve</summary>
+            <svg class="sweep-curve" viewBox="0 0 350 190" role="img" aria-label="Sweep resistance versus measured power">
+              <line class="sweep-curve-axis" x1="42" y1="150" x2="332" y2="150"></line>
+              <line class="sweep-curve-axis" x1="42" y1="24" x2="42" y2="150"></line>
+              <polyline class="sweep-curve-line" points="${line}"></polyline>
+              ${circles}
+              <text class="sweep-curve-label" x="150" y="178" fill="currentColor">Resistance (kΩ)</text>
+              <text class="sweep-curve-label" x="8" y="18" fill="currentColor">Power (W)</text>
+              <text class="sweep-curve-label" x="${Math.min(Math.max(x(mpp.resistance) + 8, 70), 300)}" y="${Math.min(Math.max(y(mpp.power) - 8, 42), 142)}" fill="currentColor">MPP</text>
+            </svg>
+            <div class="sweep-point-detail" data-sweep-point-detail="${escapeHtml(loadUid)}">Select a point to inspect V, I, P, and effective resistance.</div>
+          </details>`;
       }
 
       function loadStatusText(load) {
         if (!load) return "Not assigned";
+        if (load.sweep_run_active && load.sweep_run_mode === "continuous") return "Continuous Sweep";
         if (load.sweep_state === "running") return "Sweep Running";
         if (load.active_mode === "fixed_resistance" && load.input_enabled) return "CR Active";
         if (load.safety_state === "safety_fault") return "Safety Fault";
@@ -839,22 +940,37 @@
           safety_message: "Load state unavailable",
           resistance_setpoint_ohm: null,
           sweep_state: "idle",
+          sweep_run_mode: "single_shot",
+          sweep_run_active: false,
+          sweep_timing_stats: {},
           safety_config_complete: false,
+          sweep_config: { valid: false, error: "Load state unavailable" },
         };
         const loadUid = state.uid || configuredLoad.uid;
         const status = loadStatusText(state);
         const fixedSelected = state.selected_mode === "fixed_resistance";
         const sweepSelected = state.selected_mode === "sweep";
-        const canConfigure = Boolean(state.safety_config_complete) && !state.active_mode;
+        const canConfigure = Boolean(state.safety_config_complete) && !state.active_mode && !state.sweep_run_active;
         const canStep = Boolean(state.safety_config_complete) && state.sweep_state !== "running";
         const canEnable = fixedSelected && canConfigure;
-        const canApply = state.active_mode === "fixed_resistance" && state.input_enabled;
-        const canSweep = sweepSelected && canConfigure;
-        const canStop = Boolean(state.active_mode || state.input_enabled || state.sweep_state === "running");
+        const canApply = state.active_mode === "fixed_resistance" && state.input_enabled
+          && state.applied_resistance_ohm !== state.resistance_setpoint_ohm;
+        const sweepConfig = state.sweep_config || {};
+        const timingStats = state.sweep_timing_stats || {};
+        const singleShotSelected = state.sweep_run_mode !== "continuous";
+        const continuousSelected = state.sweep_run_mode === "continuous";
+        const canSelectRunMode = !state.sweep_run_active && state.sweep_state !== "running" && !state.active_mode;
+        const canSweep = sweepSelected && canConfigure && Boolean(sweepConfig.valid);
+        const canStop = Boolean(state.active_mode || state.input_enabled || state.sweep_state === "running" || state.sweep_run_active);
         const canClearFault = state.safety_state === "safety_fault" || state.safety_state === "instrument_error";
         const messageClass = state.safety_state === "safety_fault" || state.safety_state === "instrument_error" || !state.safety_config_complete
           ? "load-message load-message-error"
           : "load-message";
+        const lastSweep = state.last_sweep;
+        const irradiance = lastSweep?.irradiance || {};
+        const sweepValidationMessage = sweepSelected && !sweepConfig.valid
+          ? `<div class="load-message load-message-error" data-sweep-validation>${escapeHtml(sweepConfig.error || "Sweep configuration is invalid")}</div>`
+          : "";
         return `
           <details data-detail-key="${escapeHtml(detailKey(uid, "load"))}">
             <summary><span class="load-summary"><span>Load</span><span>Electronic Load · ET5406A+ · ${escapeHtml(status)}</span></span></summary>
@@ -867,8 +983,7 @@
                 ${detailRow("Selected mode", state.selected_mode)}
                 ${detailRow("Active mode", state.active_mode || "None")}
                 ${detailRow("Input", state.input_enabled ? "Enabled" : "OFF")}
-                ${detailRow("Setpoint", formatResistanceKohm(state.resistance_setpoint_ohm))}
-                ${detailRow("Measured/effective R", state.last_measurement?.load_resistance_ohm == null ? null : `${state.last_measurement.load_resistance_ohm.toFixed(2)} ohm`)}
+                ${detailRow("Measured/effective R", state.input_enabled ? formatResistance(state.last_measurement?.load_resistance_ohm) : null)}
                 ${detailRow("Sweep", state.sweep_state)}
               </div>
               <div class="load-mode-buttons">
@@ -876,6 +991,10 @@
                 <button type="button" data-load-action="select-sweep" data-load-uid="${escapeHtml(loadUid)}" class="${sweepSelected ? "load-mode-selected" : ""}" ${canConfigure ? "" : "disabled"}>Sweep</button>
               </div>
               ${fixedSelected ? `
+                <div class="wifi-detail-grid" data-fixed-resistance-controls>
+                  ${detailRow("Selected resistance", formatResistanceKohm(state.resistance_setpoint_ohm))}
+                  ${detailRow("Applied resistance", state.input_enabled ? formatResistanceKohm(state.applied_resistance_ohm) : null)}
+                </div>
                 <div class="digit-stepper-wrap" aria-label="Fixed resistance digit stepper">
                   <div class="digit-stepper">
                     ${[1000, 100, 10].map(step => `<button type="button" data-load-action="step" data-direction="1" data-step-ohm="${step}" data-load-uid="${escapeHtml(loadUid)}" ${canStep ? "" : "disabled"}>▲</button>`).join("")}
@@ -892,13 +1011,62 @@
                   <button type="button" data-load-action="clear-fault" data-load-uid="${escapeHtml(loadUid)}" ${canClearFault ? "" : "disabled"}>Clear Latched Fault</button>
                 </div>
               ` : `
+                <div class="sweep-result" data-sweep-run-mode>
+                  <h3 class="sweep-result-title">Run mode</h3>
+                  <div class="load-mode-buttons">
+                    <button type="button" data-load-action="select-single-shot" data-load-uid="${escapeHtml(loadUid)}" class="${singleShotSelected ? "load-mode-selected" : ""}" ${canSelectRunMode ? "" : "disabled"}>Single Shot</button>
+                    <button type="button" data-load-action="select-continuous" data-load-uid="${escapeHtml(loadUid)}" class="${continuousSelected ? "load-mode-selected" : ""}" ${canSelectRunMode ? "" : "disabled"}>Continuous</button>
+                  </div>
+                </div>
+                <div class="wifi-detail-grid" data-sweep-summary>
+                  ${detailRow("Sweep range", sweepConfig.valid ? `${formatResistanceKohm(sweepConfig.max_resistance_ohm)} → ${formatResistanceKohm(sweepConfig.min_resistance_ohm)}` : null)}
+                  ${detailRow("Points", sweepConfig.valid ? sweepConfig.point_count : null)}
+                  ${detailRow("Settle time", formatNumber(sweepConfig.settle_s, 1, " s"))}
+                  ${continuousSelected ? detailRow("Interval", formatNumber(sweepConfig.interval_s, 0, " s")) : ""}
+                </div>
+                ${sweepValidationMessage}
+                ${lastSweep ? `
+                  <div class="sweep-result" data-last-sweep>
+                    <h3 class="sweep-result-title">Last Sweep</h3>
+                    <div class="wifi-detail-grid">
+                      ${detailRow("Electrical sweep", lastSweep.electrical_status || lastSweep.quality)}
+                      ${detailRow("Irradiance", lastSweep.irradiance_status || "—")}
+                      ${detailRow("Timing", lastSweep.timing_status)}
+                      ${detailRow("Duration", formatNumber(lastSweep.duration_s, 2, " s"))}
+                      ${detailRow("Points", Array.isArray(lastSweep.points) ? lastSweep.points.length : 0)}
+                      ${detailRow("VMPP", formatNumber(lastSweep.vmpp_v, 3, " V"))}
+                      ${detailRow("IMPP", formatNumber(lastSweep.impp_a, 3, " A"))}
+                      ${detailRow("PMPP", formatNumber(lastSweep.pmpp_w, 3, " W"))}
+                      ${detailRow("RMPP", formatResistance(lastSweep.rmpp_ohm))}
+                      ${optionalDetailRow("Irradiance mean", typeof irradiance.mean_w_m2 === "number" ? `${irradiance.mean_w_m2.toFixed(1)} W/m²` : null)}
+                      ${optionalDetailRow("Irradiance range", typeof irradiance.min_w_m2 === "number" && typeof irradiance.max_w_m2 === "number" ? `${irradiance.min_w_m2.toFixed(1)}–${irradiance.max_w_m2.toFixed(1)} W/m²` : null)}
+                      ${optionalDetailRow("Irradiance std", typeof irradiance.std_w_m2 === "number" ? `${irradiance.std_w_m2.toFixed(1)} W/m²` : null)}
+                    </div>
+                  </div>
+                  ${sweepCurveMarkup(loadUid, lastSweep)}
+                ` : `${detailRow("Last MPP", null)}`}
+                ${continuousSelected ? `
+                  <div class="sweep-result" data-continuous-timing>
+                    <h3 class="sweep-result-title">Continuous · ${escapeHtml(formatValue(timingStats.completed_sweep_count || 0))} sweeps</h3>
+                    <div class="wifi-detail-grid">
+                      ${detailRow("Last", formatNumber(timingStats.last_duration_s, 2, " s"))}
+                      ${detailRow("Min", formatNumber(timingStats.min_duration_s, 2, " s"))}
+                      ${detailRow("Max", formatNumber(timingStats.max_duration_s, 2, " s"))}
+                      ${detailRow("Mean", formatNumber(timingStats.mean_duration_s, 2, " s"))}
+                      ${detailRow("Median", formatNumber(timingStats.median_duration_s, 2, " s"))}
+                      ${detailRow("P95", formatNumber(timingStats.p95_duration_s, 2, " s"))}
+                      ${detailRow("Overruns", timingStats.overrun_count || 0)}
+                      ${detailRow("Skipped boundaries", timingStats.skipped_boundary_count || 0)}
+                    </div>
+                  </div>
+                ` : ""}
                 <div class="load-actions">
                   <button type="button" data-load-action="start-sweep" data-load-uid="${escapeHtml(loadUid)}" ${canSweep ? "" : "disabled"}>Start Sweep</button>
                   <button type="button" class="load-stop" data-load-action="disable" data-load-uid="${escapeHtml(loadUid)}" ${canStop ? "" : "disabled"}>Stop / Disable</button>
                   <button type="button" data-load-action="clear-fault" data-load-uid="${escapeHtml(loadUid)}" ${canClearFault ? "" : "disabled"}>Clear Latched Fault</button>
                 </div>
               `}
-              <div class="${messageClass}">${escapeHtml(state.safety_message || "")}</div>
+              ${sweepSelected && !sweepConfig.valid ? "" : `<div class="${messageClass}">${escapeHtml(state.safety_message || "")}</div>`}
             </div>
           </details>
         `;
@@ -910,6 +1078,9 @@
         if (action === "select-fixed" || action === "select-sweep") {
           path = `/loads/${encodeURIComponent(uid)}/select`;
           payload.mode = action === "select-fixed" ? "fixed_resistance" : "sweep";
+        } else if (action === "select-single-shot" || action === "select-continuous") {
+          path = `/loads/${encodeURIComponent(uid)}/sweep/run-mode`;
+          payload.run_mode = action === "select-continuous" ? "continuous" : "single_shot";
         } else if (action === "step") {
           path = `/loads/${encodeURIComponent(uid)}/step`;
           payload = { step_ohm: Number(element.dataset.stepOhm), direction: Number(element.dataset.direction) };
@@ -932,6 +1103,21 @@
         const result = await response.json();
         if (!response.ok) throw new Error(result.error || "Load control failed");
         await refreshWifiNodes();
+      }
+
+      function inspectSweepPoint(element) {
+        const uid = element.dataset.loadUid;
+        const index = Number(element.dataset.pointIndex);
+        const point = loadStatesByUid.get(uid)?.last_sweep?.points?.[index];
+        const target = wifiNodeListEl.querySelector(`[data-sweep-point-detail="${CSS.escape(uid)}"]`);
+        if (!point || !target) return;
+        target.textContent = [
+          `R set ${formatResistance(point.resistance_setpoint_ohm)}`,
+          `V ${formatNumber(point.voltage_v, 3, " V")}`,
+          `I ${formatNumber(point.current_a, 3, " A")}`,
+          `P ${formatNumber(point.power_w, 3, " W")}`,
+          `Effective R ${formatResistance(point.load_resistance_ohm)}`,
+        ].join(" · ");
       }
 
       function captureSolarDetailOpenState() {
@@ -981,9 +1167,10 @@
           const ipAddress = extended.ip;
           const uid = configured.uid || reading?.uid || "Unknown UID";
           const timestamp = reading?.timestamp ? new Date(reading.timestamp).toLocaleString() : "—";
-          const panelVoltages = state === "LIVE" ? getPanelVoltages(data) : [null, null, null, null];
           const configuredLoad = configured.load || null;
           const load = configuredLoad ? loadStatesByUid.get(configuredLoad.uid) : null;
+          const panelReadings = panelReadingValues(data, load);
+          const localSource = configured.source_location === "local";
           const errorMarkup = error ? `<div class="time-message">${escapeHtml(error)}</div>` : "";
 
           return `
@@ -996,42 +1183,31 @@
                 <details data-detail-key="${escapeHtml(detailKey(uid, "identity"))}">
                   <summary>Identity</summary>
                   <div class="wifi-detail-grid">
-                    ${detailRow("Node type", extended.node_type)}
-                    ${detailRow("Node model", nodeModel)}
-                    ${detailRow("Firmware", firmware)}
-                    ${detailRow("Protocol", extended.protocol)}
-                    ${detailRow("IP address", ipAddress || configured.host)}
-                    ${detailRow("MAC address", extended.mac)}
+                    ${detailRow("Type", "Solar Panel")}
+                    ${detailRow("UID", uid)}
+                    ${localSource ? "" : optionalDetailRow("Node model", nodeModel)}
+                    ${localSource ? "" : optionalDetailRow("Firmware", firmware)}
+                    ${localSource ? "" : optionalDetailRow("Protocol", extended.protocol)}
+                    ${localSource ? "" : optionalDetailRow("IP address", ipAddress || configured.host)}
+                    ${localSource ? "" : optionalDetailRow("MAC address", extended.mac)}
                   </div>
                 </details>
                 <details data-detail-key="${escapeHtml(detailKey(uid, "health"))}">
                   <summary>Health</summary>
                   <div class="wifi-detail-grid">
-                    ${detailRow("Voltage OK", formatVoltageOk(extended.voltage_ok))}
-                    ${detailRow("RSSI", rssi === undefined ? null : `${rssi} dBm`)}
                     ${detailRow("Last updated", timestamp)}
                     ${detailRow("Current state", state)}
+                    ${localSource ? "" : optionalDetailRow("Voltage OK", extended.voltage_ok === undefined ? null : formatVoltageOk(extended.voltage_ok))}
+                    ${localSource ? "" : optionalDetailRow("RSSI", rssi === undefined ? null : `${rssi} dBm`)}
                     ${error ? detailRow("Error", error) : ""}
-                  </div>
-                </details>
-                <details data-detail-key="${escapeHtml(detailKey(uid, "hardware"))}">
-                  <summary>Hardware</summary>
-                  <div class="wifi-detail-grid">
-                    ${detailRow("Sensor count", extended.sensor_count)}
-                    ${detailRow("ADC", extended.adc)}
-                    ${detailRow("Sensors", extended.sensors)}
                   </div>
                 </details>
                 <details data-detail-key="${escapeHtml(detailKey(uid, "panel-readings"))}">
                   <summary>Panel Readings</summary>
-                  <div class="panel-voltage-list">
-                    ${panelVoltages.map((value, index) => `
-                      <div class="panel-voltage-row">
-                        <div class="panel-voltage-label">Panel ${index + 1}</div>
-                        <div class="panel-voltage-value">${escapeHtml(formatVoltage(value))}</div>
-                      </div>
-                    `).join("")}
-                    ${load?.last_measurement ? `${detailRow("Voltage", `${load.last_measurement.voltage_v.toFixed(3)} V`)}${detailRow("Current", `${load.last_measurement.current_a.toFixed(3)} A`)}${detailRow("Power", `${load.last_measurement.power_w.toFixed(3)} W`)}` : ""}
+                  <div class="wifi-detail-grid">
+                    ${detailRow("Voltage", formatNumber(panelReadings.voltage_v, 3, " V"))}
+                    ${detailRow("Current", formatNumber(panelReadings.current_a, 3, " A"))}
+                    ${detailRow("Power", formatNumber(panelReadings.power_w, 3, " W"))}
                   </div>
                 </details>
                 ${loadFoldout(uid, configuredLoad, load)}
@@ -1086,12 +1262,25 @@
       });
 
       wifiNodeListEl.addEventListener("click", (event) => {
+        const point = event.target.closest("[data-sweep-point]");
+        if (point) {
+          inspectSweepPoint(point);
+          return;
+        }
         const button = event.target.closest("button[data-load-action]");
         if (!button || button.disabled) return;
         loadAction(button.dataset.loadUid, button.dataset.loadAction, button).catch((error) => {
           console.error(error);
           window.alert(error.message);
         });
+      });
+
+      wifiNodeListEl.addEventListener("keydown", (event) => {
+        const point = event.target.closest("[data-sweep-point]");
+        if (point && (event.key === "Enter" || event.key === " ")) {
+          event.preventDefault();
+          inspectSweepPoint(point);
+        }
       });
 
       refreshState().catch(console.error);

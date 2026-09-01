@@ -12,12 +12,18 @@ class SweepRecorderTest(unittest.TestCase):
         result = {
             "sweep_id": "sweep-001",
             "started_at": "2026-09-01T12:00:00Z",
+            "scheduled_start_at": "2026-09-01T12:00:00Z",
+            "actual_started_at": "2026-09-01T12:00:00Z",
             "completed_at": "2026-09-01T12:00:05Z",
+            "duration_s": 5.0,
+            "timing_status": "on_time",
             "panel_uid": "panel-001",
             "load_uid": "load-001",
             "load_type": "electronic_load",
             "active_mode": "sweep",
             "quality": "valid",
+            "electrical_status": "complete",
+            "irradiance_status": "valid",
             "reason": None,
             "points": [
                 {
@@ -55,6 +61,8 @@ class SweepRecorderTest(unittest.TestCase):
         self.assertEqual(rows[0]["point_count"], "1")
         self.assertEqual(rows[0]["panel_uid"], "panel-001")
         self.assertEqual(rows[0]["pmpp_w"], "0.54")
+        self.assertEqual(rows[0]["duration_s"], "5.0")
+        self.assertEqual(rows[0]["electrical_status"], "complete")
 
 
 if __name__ == "__main__":

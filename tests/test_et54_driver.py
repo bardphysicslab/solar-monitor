@@ -126,6 +126,22 @@ class ET54DriverTest(unittest.TestCase):
         self.assertIn("extended", reading)
         self.assertIn("raw", reading)
 
+    def test_active_polling_reading_uses_measure_all_values(self):
+        driver, fake = make_driver(["R 0.009 16.000 0.144 1800.0\n"])
+        reading = driver.get_reading()
+        self.assertEqual(reading["data"]["current_a"], 0.009)
+        self.assertEqual(reading["data"]["power_w"], 0.144)
+        self.assertEqual(reading["data"]["load_resistance_ohm"], 1800.0)
+        self.assertEqual(fake.writes, ["MEAS:ALL?\n"])
+
+    def test_nonphysical_resistance_sentinel_is_unavailable_but_vip_remain_valid(self):
+        driver, _fake = make_driver(["R 0.009 16.000 0.144 99999999\n"])
+        reading = driver.get_reading()
+        self.assertEqual(reading["status"], "ok")
+        self.assertEqual(reading["data"]["current_a"], 0.009)
+        self.assertEqual(reading["data"]["power_w"], 0.144)
+        self.assertIsNone(reading["data"]["load_resistance_ohm"])
+
     def test_invalid_response_returns_null_channels(self):
         driver, _fake = make_driver(["R nonsense\n"])
         reading = driver.get_reading()

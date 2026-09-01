@@ -32,6 +32,7 @@ def load_config(with_limits=True):
             "max_load_resistance_ohm": 4500,
         },
         "sweep": {
+            "interval_s": 10,
             "settle_s": 0,
             "min_load_resistance_ohm": 800,
             "max_load_resistance_ohm": 4500,
@@ -131,14 +132,37 @@ def measurement(voltage=16.2, current=0.02, power=0.324, resistance=800):
     }
 
 
-def controller(driver=None, panel=None, config=None, irradiance=None, sink=None):
+def controller(driver=None, panel=None, config=None, irradiance=None, sink=None, monotonic_fn=None, wait_fn=None):
+    kwargs = {}
+    if monotonic_fn is not None:
+        kwargs["monotonic_fn"] = monotonic_fn
+    if wait_fn is not None:
+        kwargs["wait_fn"] = wait_fn
     return ElectronicLoadController(
         driver or FakeLoad([measurement()]),
         config or load_config(),
         panel if panel is not None else panel_config(),
         irradiance_provider=lambda _start, _end: list(irradiance if irradiance is not None else [500, 502, 498]),
         sweep_result_sink=sink,
+        **kwargs,
     )
+
+
+class FakeClock:
+    def __init__(self):
+        self.now = 0.0
+        self.waits = []
+
+    def monotonic(self):
+        return self.now
+
+    def advance(self, seconds):
+        self.now += seconds
+
+    def wait(self, seconds):
+        self.waits.append(seconds)
+        self.advance(seconds)
+        return False
 
 
 class LoadControlTest(unittest.TestCase):
@@ -182,6 +206,28 @@ class LoadControlTest(unittest.TestCase):
         self.assertEqual(load.state()["resistance_setpoint_ohm"], 1380)
         self.assertEqual(driver.commands, [])
 
+    def test_state_exposes_valid_sweep_summary_without_touching_instrument(self):
+        driver = FakeLoad()
+        load = controller(driver=driver)
+        state = load.state()
+        self.assertEqual(state["sweep_config"]["resistance_values_ohm"], [1200.0, 1000.0, 800.0])
+        self.assertEqual(state["sweep_config"]["point_count"], 3)
+        self.assertEqual(state["sweep_config"]["max_resistance_ohm"], 1200.0)
+        self.assertEqual(state["sweep_config"]["min_resistance_ohm"], 800.0)
+        self.assertTrue(state["sweep_config"]["valid"])
+        self.assertEqual(driver.commands, [])
+
+    def test_state_exposes_invalid_sweep_reason_without_activation(self):
+        config = load_config()
+        config["sweep"]["resistance_values_ohm"] = ["REPLACE_WITH_SAFE_HIGH_RESISTANCE"]
+        driver = FakeLoad()
+        state = controller(driver=driver, config=config).state()
+        self.assertFalse(state["sweep_config"]["valid"])
+        self.assertEqual(state["sweep_config"]["error"], "sweep resistance values must be numeric")
+        self.assertFalse(state["input_enabled"])
+        self.assertIsNone(state["active_mode"])
+        self.assertEqual(driver.commands, [])
+
     def test_enable_prepares_while_off_then_energizes_explicitly(self):
         driver = FakeLoad([measurement(current=0, power=0, resistance=1370), measurement(resistance=1370)])
         load = controller(driver=driver)
@@ -206,6 +252,19 @@ class LoadControlTest(unittest.TestCase):
         self.assertEqual(load.state()["safety_state"], "safety_fault")
         with self.assertRaises(LoadControlError):
             load.enable_fixed()
+
+    def test_active_fixed_polling_preserves_real_current_and_power(self):
+        driver = FakeLoad([
+            measurement(current=0, power=0, resistance=1370),
+            measurement(current=0.009, power=0.144, resistance=1800),
+            measurement(current=0.009, power=0.144, resistance=1800),
+        ])
+        load = controller(driver=driver)
+        load.enable_fixed()
+        reading = load.poll_reading()
+        self.assertEqual(reading["data"]["current_a"], 0.009)
+        self.assertEqual(reading["data"]["power_w"], 0.144)
+        self.assertEqual(reading["data"]["load_resistance_ohm"], 1800)
 
     def test_voltage_current_and_power_limits_abort(self):
         cases = [
@@ -316,7 +375,97 @@ class LoadControlTest(unittest.TestCase):
             driver=FakeLoad([measurement(current=0, power=0), measurement(), measurement(), measurement()]),
             irradiance=[],
         ).run_sweep()
-        self.assertEqual(incomplete["quality"], "incomplete")
+        self.assertEqual(incomplete["electrical_status"], "complete")
+        self.assertEqual(incomplete["irradiance_status"], "unavailable")
+        self.assertEqual(incomplete["quality"], "irradiance_unavailable")
+
+    def test_single_shot_runs_once_and_leaves_input_off(self):
+        driver = FakeLoad([measurement(current=0, power=0), measurement(), measurement(), measurement()])
+        load = controller(driver=driver)
+        results = load.run_sweep_sequence("single_shot")
+        self.assertEqual(len(results), 1)
+        self.assertFalse(load.state()["sweep_run_active"])
+        self.assertFalse(driver.input_enabled)
+        self.assertEqual(driver.commands[-1], "off")
+
+    def test_continuous_uses_fixed_boundary_when_sweep_finishes_at_9_9(self):
+        clock = FakeClock()
+        driver = FakeLoad([measurement(current=0, power=0), measurement(), measurement(), measurement()] * 2)
+        driver.on_measure = lambda _count: clock.advance(2.475)
+        saved = []
+        load = controller(driver=driver, sink=saved.append, monotonic_fn=clock.monotonic, wait_fn=clock.wait)
+
+        def stop_after_two(result):
+            saved.append(result)
+            if len(saved) == 2:
+                load.disable()
+
+        load.sweep_result_sink = stop_after_two
+        results = load.run_sweep_sequence("continuous")
+        self.assertEqual(len(results), 2)
+        self.assertAlmostEqual(clock.waits[0], 0.1)
+        self.assertEqual(load.state()["sweep_timing_stats"]["skipped_boundary_count"], 0)
+        self.assertEqual(results[0]["timing_status"], "on_time")
+
+    def test_continuous_overrun_is_retained_and_resumes_next_future_boundary(self):
+        clock = FakeClock()
+        driver = FakeLoad([measurement(current=0, power=0), measurement(), measurement(), measurement()] * 2)
+        driver.on_measure = lambda _count: clock.advance(2.575)
+        saved = []
+        load = controller(driver=driver, monotonic_fn=clock.monotonic, wait_fn=clock.wait)
+
+        def retain_and_stop(result):
+            saved.append(result)
+            if len(saved) == 2:
+                load.disable()
+
+        load.sweep_result_sink = retain_and_stop
+        results = load.run_sweep_sequence("continuous")
+        self.assertEqual(results, saved)
+        self.assertEqual(results[0]["timing_status"], "overrun")
+        self.assertAlmostEqual(results[0]["duration_s"], 10.3)
+        self.assertAlmostEqual(clock.waits[0], 9.7)
+        stats = load.state()["sweep_timing_stats"]
+        self.assertEqual(stats["overrun_count"], 2)
+        self.assertEqual(stats["skipped_boundary_count"], 1)
+        operation_events = [item for item in driver.commands if item.startswith("operation:")]
+        self.assertEqual(operation_events, ["operation:start", "operation:end", "operation:start", "operation:end"])
+        self.assertFalse(driver.input_enabled)
+
+    def test_safety_fault_ends_continuous_run(self):
+        driver = FakeLoad([
+            measurement(current=0, power=0),
+            measurement(current=2.0, power=32.4),
+        ])
+        saved = []
+        load = controller(driver=driver, sink=saved.append)
+        results = load.run_sweep_sequence("continuous")
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["electrical_status"], "safety_abort")
+        self.assertEqual(load.state()["safety_state"], "safety_fault")
+        self.assertFalse(driver.input_enabled)
+
+    def test_instrument_fault_ends_continuous_run(self):
+        driver = FakeLoad()
+        driver.raise_on_measure = OSError("serial disconnected")
+        load = controller(driver=driver)
+        results = load.run_sweep_sequence("continuous")
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["electrical_status"], "instrument_error")
+        self.assertEqual(load.state()["safety_state"], "instrument_error")
+        self.assertFalse(driver.input_enabled)
+
+    def test_duration_statistics(self):
+        load = controller()
+        load._sweep_durations = [5.0, 6.0, 7.0, 8.0, 20.0]
+        load.overrun_count = 1
+        load.skipped_boundary_count = 1
+        stats = load.sweep_timing_stats()
+        self.assertEqual(stats["min_duration_s"], 5.0)
+        self.assertEqual(stats["max_duration_s"], 20.0)
+        self.assertEqual(stats["mean_duration_s"], 9.2)
+        self.assertEqual(stats["median_duration_s"], 7.0)
+        self.assertEqual(stats["p95_duration_s"], 20.0)
 
 
 if __name__ == "__main__":

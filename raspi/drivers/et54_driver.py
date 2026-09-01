@@ -14,6 +14,7 @@ except ImportError:
 CHANNELS = ("voltage_v", "current_a", "power_w", "load_resistance_ohm")
 ACKNOWLEDGMENT = "execu success"
 COMMAND_ERROR = "cmd err"
+UNAVAILABLE_RESISTANCE_SENTINEL_OHM = 99999999.0
 
 
 class ET54Error(RuntimeError):
@@ -150,34 +151,17 @@ class ET54Driver:
 
     def measure_all(self) -> dict:
         raw = self._query("MEAS:ALL?")
-        fields = raw.split()
-        if len(fields) != 4:
-            raise ET54ProtocolError(f"Invalid MEAS:ALL? field count: {raw!r}")
-        try:
-            current, voltage, power, resistance = (float(field) for field in fields)
-        except ValueError as exc:
-            raise ET54ProtocolError(f"Invalid MEAS:ALL? response: {raw!r}") from exc
-        values = (current, voltage, power, resistance)
-        if not all(math.isfinite(value) and value >= 0 for value in values):
-            raise ET54ProtocolError(f"Invalid MEAS:ALL? values: {raw!r}")
+        measurements = self._parse_measure_all_response(raw)
         self._last_seen = self._utc_timestamp()
-        return {
-            "current_a": current,
-            "voltage_v": voltage,
-            "power_w": power,
-            "load_resistance_ohm": resistance,
-        }
+        return measurements
 
     def get_reading(self) -> dict:
-        raw = ""
         try:
-            raw = self._exchange("MEAS:ALL?")
-            measurements = self._parse_measure_all_response(raw)
-            self._last_seen = self._utc_timestamp()
+            measurements = self.measure_all()
         except ET54TransportError as exc:
-            return self._error_reading("node_unavailable", str(exc), raw)
+            return self._error_reading("node_unavailable", str(exc), "")
         except (ET54ProtocolError, ValueError) as exc:
-            return self._error_reading("error", str(exc), raw)
+            return self._error_reading("error", str(exc), "")
 
         return {
             "uid": self.uid,
@@ -186,7 +170,7 @@ class ET54Driver:
             "message": "Fresh valid reading",
             "data": measurements,
             "extended": {"last_seen": self._last_seen, "port": self.port},
-            "raw": self._bound_debug(raw),
+            "raw": "",
         }
 
     def sweep_resistance(self, values: Iterable[float], settle_s: float = 0.5) -> dict:
@@ -247,14 +231,14 @@ class ET54Driver:
             current, voltage, power, resistance = (float(field) for field in fields)
         except ValueError as exc:
             raise ET54ProtocolError(f"Invalid MEAS:ALL? response: {response!r}") from exc
-        values = (current, voltage, power, resistance)
-        if not all(math.isfinite(value) and value >= 0 for value in values):
+        if not all(math.isfinite(value) and value >= 0 for value in (current, voltage, power, resistance)):
             raise ET54ProtocolError(f"Invalid MEAS:ALL? values: {response!r}")
+        normalized_resistance = None if resistance >= UNAVAILABLE_RESISTANCE_SENTINEL_OHM else resistance
         return {
             "current_a": current,
             "voltage_v": voltage,
             "power_w": power,
-            "load_resistance_ohm": resistance,
+            "load_resistance_ohm": normalized_resistance,
         }
 
     def _query(self, command: str) -> str:
