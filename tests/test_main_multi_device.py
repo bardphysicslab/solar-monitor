@@ -7,6 +7,7 @@ import unittest
 os.environ.setdefault("BARDBOX_APP_CONFIG", "raspi/config/app_config.example.json")
 
 import raspi.main as main
+from raspi.drivers.et54_driver import ET54Driver
 from raspi.drivers.spn1_driver import SPN1Driver
 from raspi.drivers.wifi_node_driver import WiFiNodeDriver
 
@@ -194,6 +195,30 @@ class MainMultiDeviceTest(unittest.TestCase):
         thread.join(timeout=1)
 
         self.assertIn(("bb-solar-pnl-001", self.wifi_reading), main.RECORDER.samples)
+
+    def test_et54_configuration_loads_as_generic_polled_driver(self):
+        drivers = main.load_drivers(
+            {
+                "drivers": [
+                    {
+                        "driver": "et54",
+                        "uid": "bb-solar-load-001",
+                        "config": {
+                            "port": "/dev/serial/by-id/test-et54",
+                            "baud": 9600,
+                            "mode": "CR",
+                            "resistance_ohm": 100,
+                        },
+                    }
+                ]
+            }
+        )
+        self.assertEqual(len(drivers), 1)
+        self.assertIsInstance(drivers[0], ET54Driver)
+        self.assertEqual(drivers[0].port, "/dev/serial/by-id/test-et54")
+
+        main.DRIVERS = [self.spn1, drivers[0], self.wifi]
+        self.assertEqual(main.polled_drivers(), [drivers[0], self.wifi])
 
 
 if __name__ == "__main__":

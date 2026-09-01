@@ -41,6 +41,21 @@
           "mode": "mean"
         }
       }
+    },
+    {
+      "driver": "et54",
+      "uid": "bb-solar-load-001",
+      "config": {
+        "port": "/dev/serial/by-id/REPLACE_ME",
+        "baud": 9600,
+        "mode": "CR",
+        "resistance_ohm": 100,
+        "recording": {
+          "enabled": true,
+          "interval_s": 10,
+          "mode": "mean"
+        }
+      }
     }
   ]
 }

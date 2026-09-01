@@ -12,6 +12,7 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
+from raspi.drivers.et54_driver import ET54Driver
 from raspi.drivers.spn1_driver import SPN1Driver
 from raspi.drivers.wifi_node_driver import WiFiNodeDriver
 from raspi.backup import DataBackupManager, backup_config_from_app_config
@@ -100,6 +101,20 @@ def load_drivers(config: Dict[str, Any]) -> List[Any]:
                     sync_interval_hours=sync_interval_hours,
                 )
             )
+        elif driver_name == "et54":
+            port = driver_config.get("port")
+            if not port:
+                raise ValueError(f"ET54 driver {uid} requires config.port")
+            loaded.append(
+                ET54Driver(
+                    uid=uid,
+                    port=port,
+                    baud=int(driver_config.get("baud", 9600)),
+                    mode=driver_config.get("mode", "CR"),
+                    resistance_ohm=float(driver_config.get("resistance_ohm", 100)),
+                    timeout_s=float(driver_config.get("timeout_s", 1.0)),
+                )
+            )
         elif driver_name == "wifi_node":
             host = driver_config.get("host")
             if not host:
@@ -139,7 +154,7 @@ def get_configured_spn1_driver() -> Optional[SPN1Driver]:
     return None
 
 
-def non_spn1_drivers() -> List[Any]:
+def polled_drivers() -> List[Any]:
     return [driver for driver in DRIVERS if not isinstance(driver, SPN1Driver)]
 
 
@@ -353,8 +368,8 @@ def spn1_acquisition_loop(stop_event: threading.Event = shutdown_event) -> None:
             stop_event.wait(0.2)
 
 
-def wifi_polling_loop(stop_event: threading.Event = shutdown_event, poll_interval_s: float = 1.0) -> None:
-    drivers = non_spn1_drivers()
+def generic_polling_loop(stop_event: threading.Event = shutdown_event, poll_interval_s: float = 1.0) -> None:
+    drivers = polled_drivers()
     while not stop_event.is_set():
         if is_run_active() and drivers:
             for driver in drivers:
@@ -449,8 +464,8 @@ def start_background_reader() -> None:
     spn1_thread = threading.Thread(target=spn1_acquisition_loop, daemon=True)
     spn1_thread.start()
 
-    wifi_thread = threading.Thread(target=wifi_polling_loop, daemon=True)
-    wifi_thread.start()
+    polling_thread = threading.Thread(target=generic_polling_loop, daemon=True)
+    polling_thread.start()
 
     recorder_thread = threading.Thread(target=recorder_flush_loop, daemon=True)
     recorder_thread.start()
@@ -466,9 +481,9 @@ def flush_recorders_on_shutdown() -> None:
         RECORDER.flush_all()
     except Exception as exc:
         logger.warning("CSV recording shutdown flush failed: %s", exc)
-    spn1_driver = get_configured_spn1_driver()
-    if spn1_driver is not None:
-        spn1_driver.close()
+    for driver in DRIVERS:
+        if hasattr(driver, "close"):
+            driver.close()
 
 
 @app.get("/")

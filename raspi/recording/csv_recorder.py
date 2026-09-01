@@ -25,6 +25,17 @@ SPN1_HEADER = [
     "sun",
 ]
 
+ET54_HEADER = [
+    "timestamp_utc",
+    "window_start_utc",
+    "window_end_utc",
+    "sample_count",
+    "voltage_v",
+    "current_a",
+    "power_w",
+    "load_resistance_ohm",
+]
+
 SOLAR_HEADER = [
     "timestamp_utc",
     "window_start_utc",
@@ -301,6 +312,13 @@ class CsvAveragingRecorder:
             window.add_binary("sun", data.get("sun"))
             return
 
+        if window.driver_name == "et54":
+            window.add_numeric("voltage_v", data.get("voltage_v"))
+            window.add_numeric("current_a", data.get("current_a"))
+            window.add_numeric("power_w", data.get("power_w"))
+            window.add_numeric("load_resistance_ohm", data.get("load_resistance_ohm"))
+            return
+
         panel_1 = data.get("panel_voltage_1_v")
         if panel_1 is None:
             panel_1 = data.get("panel_voltage_v")
@@ -358,6 +376,17 @@ class CsvAveragingRecorder:
             )
             return base
 
+        if config.driver_name == "et54":
+            base.update(
+                {
+                    "voltage_v": self._format_mean(window, "voltage_v", 4),
+                    "current_a": self._format_mean(window, "current_a", 4),
+                    "power_w": self._format_mean(window, "power_w", 4),
+                    "load_resistance_ohm": self._format_mean(window, "load_resistance_ohm", 4),
+                }
+            )
+            return base
+
         base.update(
             {
                 "panel_voltage_1_v": self._format_mean(window, "panel_voltage_1_v", 4),
@@ -386,7 +415,12 @@ class CsvAveragingRecorder:
         device_dir = self.data_root / uid
         device_dir.mkdir(parents=True, exist_ok=True)
         path = device_dir / f"{end_utc.astimezone(timezone.utc).date().isoformat()}.csv"
-        header = SPN1_HEADER if driver_name == "spn1" else SOLAR_HEADER
+        if driver_name == "spn1":
+            header = SPN1_HEADER
+        elif driver_name == "et54":
+            header = ET54_HEADER
+        else:
+            header = SOLAR_HEADER
         needs_header = not path.exists() or path.stat().st_size == 0
 
         with path.open("a", encoding="utf-8", newline="") as handle:
