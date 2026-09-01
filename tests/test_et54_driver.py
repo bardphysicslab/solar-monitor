@@ -67,6 +67,24 @@ class ET54DriverTest(unittest.TestCase):
         )
         self.assertEqual(fake.writes, ["MEAS:ALL?\n"])
 
+    def test_get_info_reports_live_resistance_setpoint(self):
+        driver, fake = make_driver(["R800.00\n"])
+        info = driver.get_info()
+
+        self.assertEqual(info["resistance_setpoint_ohm"], 800.0)
+        self.assertNotIn("configured_resistance_ohm", info)
+        self.assertEqual(fake.writes, ["RESI:CR?\n"])
+
+    def test_get_info_returns_none_when_live_resistance_query_fails(self):
+        driver, fake = make_driver(["Rcmd err\n"])
+        info = driver.get_info()
+
+        self.assertIsNone(info["resistance_setpoint_ohm"])
+        self.assertNotIn("configured_resistance_ohm", info)
+        self.assertEqual(info["uid"], "bb-solar-load-001")
+        self.assertEqual(info["configured_mode"], "CR")
+        self.assertEqual(fake.writes, ["RESI:CR?\n"])
+
     def test_setter_acknowledgment_is_consumed_before_query(self):
         driver, fake = make_driver(["Rexecu success\n", "R100.00\n"])
         driver.set_resistance(100)

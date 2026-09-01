@@ -53,6 +53,11 @@ class ET54Driver:
             raise ValueError("ET54 currently supports only CR mode")
 
     def get_info(self) -> dict:
+        try:
+            resistance_setpoint_ohm = self.get_resistance()
+        except Exception:
+            resistance_setpoint_ohm = None
+
         return {
             "uid": self.uid,
             "manufacturer": "East Tester",
@@ -64,7 +69,7 @@ class ET54Driver:
             "port": self.port,
             "baud": self.baud,
             "configured_mode": self.mode,
-            "configured_resistance_ohm": self.resistance_ohm,
+            "resistance_setpoint_ohm": resistance_setpoint_ohm,
         }
 
     def get_capabilities(self) -> dict:
