@@ -381,7 +381,7 @@ def poll_all_drivers_once() -> None:
         logger.warning("CSV recording due-flush failed: %s", exc)
 
 
-def poll_driver_once(driver: Any) -> None:
+def poll_driver_once(driver: Any, record: bool = True) -> None:
     driver_uid = getattr(driver, "uid", "unknown")
     try:
         controller = LOAD_CONTROLLERS.get(driver_uid)
@@ -392,11 +392,12 @@ def poll_driver_once(driver: Any) -> None:
         if isinstance(driver, SPN1Driver):
             record_spn1_irradiance(reading)
         set_latest_reading(driver_uid, reading)
-        try:
-            if is_fresh_for_recording(driver_uid, reading):
-                RECORDER.add_reading(driver_uid, reading)
-        except Exception as exc:
-            logger.warning("CSV recording failed to accept sample for %s: %s", driver_uid, exc)
+        if record:
+            try:
+                if is_fresh_for_recording(driver_uid, reading):
+                    RECORDER.add_reading(driver_uid, reading)
+            except Exception as exc:
+                logger.warning("CSV recording failed to accept sample for %s: %s", driver_uid, exc)
     except Exception as exc:
         logger.warning("Driver polling failed for %s: %s", driver_uid, exc)
         set_latest_reading(
@@ -424,17 +425,33 @@ def spn1_acquisition_loop(stop_event: threading.Event = shutdown_event) -> None:
             stop_event.wait(0.2)
 
 
+def drivers_due_for_polling(drivers: List[Any], run_is_active: bool) -> List[Any]:
+    if run_is_active:
+        return drivers
+    due = []
+    for driver in drivers:
+        controller = LOAD_CONTROLLERS.get(getattr(driver, "uid", ""))
+        if controller is None:
+            continue
+        state = controller.state()
+        if state.get("input_enabled") and state.get("sweep_state") != "running":
+            due.append(driver)
+    return due
+
+
 def generic_polling_loop(stop_event: threading.Event = shutdown_event, poll_interval_s: float = 1.0) -> None:
     drivers = polled_drivers()
     while not stop_event.is_set():
-        if is_run_active() and drivers:
-            for driver in drivers:
+        run_is_active = is_run_active()
+        due_drivers = drivers_due_for_polling(drivers, run_is_active)
+        if due_drivers:
+            for driver in due_drivers:
                 if stop_event.is_set():
                     break
                 controller = LOAD_CONTROLLERS.get(getattr(driver, "uid", ""))
                 if controller is not None and controller.state()["sweep_state"] == "running":
                     continue
-                poll_driver_once(driver)
+                poll_driver_once(driver, record=run_is_active)
             stop_event.wait(poll_interval_s)
         else:
             stop_event.wait(0.2)

@@ -298,6 +298,72 @@ class MainMultiDeviceTest(unittest.TestCase):
         )
         self.assertNotEqual(payload["live_reading"], payload["last_measurement"])
 
+    def test_background_poll_stores_one_successful_et54_reading_for_load_api(self):
+        stop_event = threading.Event()
+
+        class Driver:
+            uid = "yertai-et5406a-plus-001"
+
+        class ActiveController:
+            uid = Driver.uid
+
+            def __init__(self):
+                self.poll_count = 0
+
+            def state(self):
+                return {
+                    "uid": self.uid,
+                    "sweep_state": "idle",
+                    "input_enabled": True,
+                    "active_mode": "fixed_resistance",
+                    "last_measurement": {
+                        "voltage_v": 16.253,
+                        "current_a": 0.0,
+                        "power_w": 0.0,
+                        "load_resistance_ohm": None,
+                    },
+                }
+
+            def poll_reading(self):
+                self.poll_count += 1
+                stop_event.set()
+                return {
+                    "uid": self.uid,
+                    "timestamp": "2026-09-01T16:00:00Z",
+                    "status": "ok",
+                    "data": {
+                        "voltage_v": 16.246,
+                        "current_a": 0.010,
+                        "power_w": 0.16,
+                        "load_resistance_ohm": 1686.3,
+                    },
+                    "extended": {},
+                    "raw": "one ET54 frame",
+                }
+
+        driver = Driver()
+        controller = ActiveController()
+        main.DRIVERS = [driver]
+        main.LOAD_CONTROLLERS = {driver.uid: controller}
+        main.run_active = False
+
+        self.assertEqual(main.drivers_due_for_polling([driver], False), [driver])
+        main.generic_polling_loop(stop_event, poll_interval_s=0.01)
+
+        response = main.get_loads()
+        payload = json.loads(response.body)["loads"][0]
+        self.assertEqual(controller.poll_count, 1)
+        self.assertEqual(
+            payload["live_reading"],
+            {
+                "voltage_v": 16.246,
+                "current_a": 0.010,
+                "power_w": 0.16,
+                "load_resistance_ohm": 1686.3,
+            },
+        )
+        self.assertEqual(main.RECORDER.samples, [])
+
     def test_load_api_uses_none_instead_of_stale_values_after_poll_failure(self):
         class Controller:
             uid = "yertai-et5406a-plus-001"
