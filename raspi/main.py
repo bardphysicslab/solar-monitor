@@ -683,7 +683,20 @@ def load_error_response(exc: Exception) -> JSONResponse:
 
 @app.get("/loads")
 def get_loads():
-    return JSONResponse({"loads": [controller.state() for controller in LOAD_CONTROLLERS.values()]})
+    return JSONResponse({"loads": [load_state_payload(controller) for controller in LOAD_CONTROLLERS.values()]})
+
+
+def load_state_payload(controller: ElectronicLoadController) -> Dict[str, Any]:
+    state = controller.state()
+    with state_lock:
+        reading = latest_readings_by_uid.get(controller.uid)
+    channels = ("voltage_v", "current_a", "power_w", "load_resistance_ohm")
+    live_reading = {channel: None for channel in channels}
+    if reading is not None and reading.get("status") == "ok":
+        data = reading.get("data") or {}
+        live_reading = {channel: data.get(channel) for channel in channels}
+    state["live_reading"] = live_reading
+    return state
 
 
 @app.post("/loads/{uid}/select")

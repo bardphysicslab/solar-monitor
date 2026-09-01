@@ -788,11 +788,20 @@
       }
 
       function panelReadingValues(data, load) {
-        const measurement = load?.last_measurement || {};
+        if (load) {
+          const measurement = load.live_reading || load.last_measurement || {};
+          return {
+            voltage_v: measurement.voltage_v ?? null,
+            current_a: measurement.current_a ?? null,
+            power_w: measurement.power_w ?? null,
+            load_resistance_ohm: measurement.load_resistance_ohm ?? null,
+          };
+        }
         return {
-          voltage_v: measurement.voltage_v ?? data.voltage_v ?? data.panel_voltage_v ?? null,
-          current_a: measurement.current_a ?? data.current_a ?? null,
-          power_w: measurement.power_w ?? data.power_w ?? null,
+          voltage_v: data.voltage_v ?? data.panel_voltage_v ?? null,
+          current_a: data.current_a ?? null,
+          power_w: data.power_w ?? null,
+          load_resistance_ohm: data.load_resistance_ohm ?? null,
         };
       }
 
@@ -983,7 +992,7 @@
                 ${detailRow("Selected mode", state.selected_mode)}
                 ${detailRow("Active mode", state.active_mode || "None")}
                 ${detailRow("Input", state.input_enabled ? "Enabled" : "OFF")}
-                ${detailRow("Measured/effective R", state.input_enabled ? formatResistance(state.last_measurement?.load_resistance_ohm) : null)}
+                ${detailRow("Measured/effective R", state.input_enabled ? formatResistance((state.live_reading || state.last_measurement)?.load_resistance_ohm) : null)}
                 ${detailRow("Sweep", state.sweep_state)}
               </div>
               <div class="load-mode-buttons">

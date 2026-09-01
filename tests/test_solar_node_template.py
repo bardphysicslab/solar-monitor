@@ -13,6 +13,14 @@ class SolarNodeTemplateTest(unittest.TestCase):
         self.assertIn('detailRow("Voltage", formatNumber(panelReadings.voltage_v', TEMPLATE)
         self.assertIn('detailRow("Current", formatNumber(panelReadings.current_a', TEMPLATE)
         self.assertIn('detailRow("Power", formatNumber(panelReadings.power_w', TEMPLATE)
+        self.assertIn("const measurement = load.live_reading || load.last_measurement || {};", TEMPLATE)
+        panel_function = TEMPLATE[
+            TEMPLATE.index("function panelReadingValues"):
+            TEMPLATE.index("function mergeSolarNodes")
+        ]
+        self.assertNotIn("measurement.voltage_v ?? data.", panel_function)
+        self.assertNotIn("measurement.current_a ?? data.", panel_function)
+        self.assertNotIn("measurement.power_w ?? data.", panel_function)
 
     def test_configured_nodes_are_available_before_readings(self):
         self.assertIn("const configuredSolarNodes = {{ configured_wifi_nodes | tojson }};", TEMPLATE)
@@ -139,7 +147,10 @@ class SolarNodeTemplateTest(unittest.TestCase):
         self.assertNotIn('Math.max(y(mpp.power) - 8, 16)', TEMPLATE)
 
     def test_effective_resistance_requires_enabled_input(self):
-        self.assertIn("state.input_enabled ? formatResistance(state.last_measurement?.load_resistance_ohm) : null", TEMPLATE)
+        self.assertIn(
+            "state.input_enabled ? formatResistance((state.live_reading || state.last_measurement)?.load_resistance_ohm) : null",
+            TEMPLATE,
+        )
 
     def test_resistance_format_uses_ohm_symbols(self):
         self.assertIn("function formatResistance(valueOhm)", TEMPLATE)

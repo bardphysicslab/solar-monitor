@@ -253,6 +253,86 @@ class MainMultiDeviceTest(unittest.TestCase):
         self.assertNotIn("load", by_uid["panel-002"])
         self.assertEqual(by_uid["panel-002"]["source_location"], "network")
 
+    def test_load_api_uses_latest_associated_et54_reading_atomically(self):
+        class ActiveController:
+            uid = "yertai-et5406a-plus-001"
+
+            def state(self):
+                return {
+                    "uid": self.uid,
+                    "panel_uid": "bb-solar-pnl-001",
+                    "active_mode": "fixed_resistance",
+                    "input_enabled": True,
+                    "applied_resistance_ohm": 1800.0,
+                    "last_measurement": {
+                        "voltage_v": 16.255,
+                        "current_a": 0.0,
+                        "power_w": 0.0,
+                        "load_resistance_ohm": None,
+                    },
+                }
+
+        controller = ActiveController()
+        main.LOAD_CONTROLLERS = {controller.uid: controller}
+        main.latest_readings_by_uid[controller.uid] = {
+            "uid": controller.uid,
+            "status": "ok",
+            "data": {
+                "voltage_v": 16.246,
+                "current_a": 0.010,
+                "power_w": 0.16,
+                "load_resistance_ohm": 1686.3,
+            },
+        }
+
+        response = main.get_loads()
+        payload = json.loads(response.body)["loads"][0]
+        self.assertEqual(
+            payload["live_reading"],
+            {
+                "voltage_v": 16.246,
+                "current_a": 0.010,
+                "power_w": 0.16,
+                "load_resistance_ohm": 1686.3,
+            },
+        )
+        self.assertNotEqual(payload["live_reading"], payload["last_measurement"])
+
+    def test_load_api_uses_none_instead_of_stale_values_after_poll_failure(self):
+        class Controller:
+            uid = "yertai-et5406a-plus-001"
+
+            def state(self):
+                return {
+                    "uid": self.uid,
+                    "last_measurement": {
+                        "voltage_v": 16.255,
+                        "current_a": 0.0,
+                        "power_w": 0.0,
+                        "load_resistance_ohm": None,
+                    },
+                }
+
+        controller = Controller()
+        main.LOAD_CONTROLLERS = {controller.uid: controller}
+        main.latest_readings_by_uid[controller.uid] = {
+            "uid": controller.uid,
+            "status": "error",
+            "error": "serial timeout",
+        }
+
+        response = main.get_loads()
+        payload = json.loads(response.body)["loads"][0]
+        self.assertEqual(
+            payload["live_reading"],
+            {
+                "voltage_v": None,
+                "current_a": None,
+                "power_w": None,
+                "load_resistance_ohm": None,
+            },
+        )
+
     def test_running_sweep_is_skipped_without_blocking_other_generic_drivers(self):
         class RunningController:
             def state(self):
