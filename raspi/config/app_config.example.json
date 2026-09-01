@@ -44,7 +44,7 @@
     },
     {
       "driver": "et54",
-      "uid": "bb-solar-load-001",
+      "uid": "yertai-et5406a-plus-001",
       "config": {
         "port": "/dev/serial/by-id/REPLACE_ME",
         "baud": 9600,

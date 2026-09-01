@@ -90,6 +90,17 @@ class CsvRecorderTest(unittest.TestCase):
                         "uid": "bb-solar-pnl-002",
                         "config": {"recording": {"enabled": True, "interval_s": 5}},
                     },
+                    {
+                        "driver": "et54",
+                        "uid": "yertai-et5406a-plus-001",
+                        "config": {
+                            "recording": {
+                                "enabled": True,
+                                "interval_s": 10,
+                                "mode": "mean",
+                            }
+                        },
+                    },
                 ]
             }
         )
@@ -99,6 +110,10 @@ class CsvRecorderTest(unittest.TestCase):
         self.assertEqual(by_uid["spn1-0001"].interval_s, 10)
         self.assertEqual(by_uid["bb-solar-pnl-001"].interval_s, 3)
         self.assertEqual(by_uid["bb-solar-pnl-002"].interval_s, 5)
+        self.assertTrue(by_uid["yertai-et5406a-plus-001"].enabled)
+        self.assertEqual(by_uid["yertai-et5406a-plus-001"].driver_name, "et54")
+        self.assertEqual(by_uid["yertai-et5406a-plus-001"].interval_s, 10)
+        self.assertEqual(by_uid["yertai-et5406a-plus-001"].mode, "mean")
         self.assertEqual(parse_interval_s(0, "bad"), 10)
 
     def test_unsupported_mode_is_rejected(self):
@@ -194,32 +209,37 @@ class CsvRecorderTest(unittest.TestCase):
     def test_et54_window_uses_electrical_measurement_schema(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             recorder = self.make_recorder(
-                [RecorderConfig("bb-solar-load-001", "et54", enabled=True, interval_s=10)],
+                [RecorderConfig("yertai-et5406a-plus-001", "et54", enabled=True, interval_s=10)],
                 temp_dir,
             )
-            recorder.add_reading(
-                "bb-solar-load-001",
-                {
-                    "uid": "bb-solar-load-001",
-                    "timestamp": "ignored",
-                    "status": "ok",
-                    "data": {
-                        "voltage_v": 5.055,
-                        "current_a": 0.05,
-                        "power_w": 0.25,
-                        "load_resistance_ohm": 100.351,
+            for voltage, current, power, resistance in (
+                (16.0, 0.019, 0.304, 800.0),
+                (16.4, 0.021, 0.340, 802.0),
+            ):
+                recorder.add_reading(
+                    "yertai-et5406a-plus-001",
+                    {
+                        "uid": "yertai-et5406a-plus-001",
+                        "timestamp": "ignored",
+                        "status": "ok",
+                        "data": {
+                            "voltage_v": voltage,
+                            "current_a": current,
+                            "power_w": power,
+                            "load_resistance_ohm": resistance,
+                        },
+                        "extended": {},
+                        "raw": None,
                     },
-                    "extended": {},
-                    "raw": None,
-                },
-            )
+                )
             recorder.flush_all()
 
-            row = self.rows_for(temp_dir, "bb-solar-load-001")[0]
-            self.assertEqual(row["voltage_v"], "5.0550")
-            self.assertEqual(row["current_a"], "0.0500")
-            self.assertEqual(row["power_w"], "0.2500")
-            self.assertEqual(row["load_resistance_ohm"], "100.3510")
+            row = self.rows_for(temp_dir, "yertai-et5406a-plus-001")[0]
+            self.assertEqual(row["sample_count"], "2")
+            self.assertEqual(row["voltage_v"], "16.2000")
+            self.assertEqual(row["current_a"], "0.0200")
+            self.assertEqual(row["power_w"], "0.3220")
+            self.assertEqual(row["load_resistance_ohm"], "801.0000")
             self.assertNotIn("panel_voltage_1_v", row)
 
     def test_solar_window_maps_single_channel_and_blanks_missing_values(self):

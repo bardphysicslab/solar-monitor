@@ -202,12 +202,17 @@ class MainMultiDeviceTest(unittest.TestCase):
                 "drivers": [
                     {
                         "driver": "et54",
-                        "uid": "bb-solar-load-001",
+                        "uid": "yertai-et5406a-plus-001",
                         "config": {
                             "port": "/dev/serial/by-id/test-et54",
                             "baud": 9600,
                             "mode": "CR",
-                            "resistance_ohm": 100,
+                            "resistance_ohm": 800,
+                            "recording": {
+                                "enabled": True,
+                                "interval_s": 10,
+                                "mode": "mean",
+                            },
                         },
                     }
                 ]
@@ -215,7 +220,10 @@ class MainMultiDeviceTest(unittest.TestCase):
         )
         self.assertEqual(len(drivers), 1)
         self.assertIsInstance(drivers[0], ET54Driver)
+        self.assertEqual(drivers[0].uid, "yertai-et5406a-plus-001")
         self.assertEqual(drivers[0].port, "/dev/serial/by-id/test-et54")
+        self.assertEqual(drivers[0].resistance_ohm, 800.0)
+        self.assertIsNone(drivers[0]._instrument)
 
         main.DRIVERS = [self.spn1, drivers[0], self.wifi]
         self.assertEqual(main.polled_drivers(), [drivers[0], self.wifi])
