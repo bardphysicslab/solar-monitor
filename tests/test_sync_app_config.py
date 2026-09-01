@@ -16,7 +16,9 @@ from scripts import sync_app_config as sync
 
 
 def test_default_paths_use_solar_monitor_layout():
-    assert sync.DEFAULT_EXAMPLE_PATH == REPO_ROOT / "raspi" / "config" / "app_config.example.json"
+    assert sync.DEFAULT_EXAMPLE_PATH == (
+        REPO_ROOT / "raspi" / "config" / "app_config.example.json"
+    )
     assert sync.DEFAULT_LIVE_PATH == REPO_ROOT / "raspi" / "config" / "app_config.json"
 
 
@@ -69,6 +71,51 @@ def test_nodes_merge_by_uid_without_adding_or_removing_nodes(tmp_path):
     assert any("skipped example-only node" in item for item in summary.skipped_sections)
 
 
+def test_drivers_merge_by_uid_without_adding_or_removing_drivers(tmp_path):
+    example_path, live_path = configs(
+        tmp_path,
+        {"drivers": [
+            {
+                "driver": "et54",
+                "uid": "load-001",
+                "config": {"port": "/dev/example", "limits": {"max_power_w": 200}},
+            },
+            {"driver": "spn1", "uid": "example-only", "config": {"baud": 9600}},
+        ]},
+        {"drivers": [
+            {
+                "driver": "et54",
+                "uid": "load-001",
+                "config": {"port": "/dev/local"},
+            },
+            {"driver": "custom", "uid": "local-only", "config": {"secret": "preserved"}},
+        ]},
+    )
+    summary, merged = sync.synchronize(example_path, live_path)
+    assert summary.added_driver_fields == [
+        "drivers[uid=load-001].config.limits"
+    ]
+    assert "drivers[uid=load-001].config.port" in summary.preserved_local_values
+    assert [driver["uid"] for driver in merged["drivers"]] == ["load-001", "local-only"]
+    assert merged["drivers"][0]["config"]["port"] == "/dev/local"
+    assert merged["drivers"][0]["config"]["limits"] == {"max_power_w": 200}
+    assert merged["drivers"][1]["config"]["secret"] == "preserved"
+    assert any("drivers[uid=example-only]: skipped example-only driver" == item for item in summary.skipped_sections)
+
+
+def test_driver_fields_require_migration(tmp_path):
+    example_path, live_path = configs(
+        tmp_path,
+        {"drivers": [{"uid": "load-001", "config": {"new_safety_field": True}}]},
+        {"drivers": [{"uid": "load-001", "config": {}}]},
+    )
+    summary, _ = sync.synchronize(example_path, live_path)
+    assert summary.migration_required
+    assert summary.added_driver_fields == [
+        "drivers[uid=load-001].config.new_safety_field"
+    ]
+
+
 def test_dry_run_does_not_write(tmp_path):
     example_path, live_path = configs(tmp_path, {"new": True}, {"existing": True})
     original = live_path.read_bytes()
@@ -110,4 +157,5 @@ def test_check_exit_status(tmp_path, live, expected_code, expected_line):
     assert result.returncode == expected_code
     assert expected_line in result.stdout
     assert "Added node fields: none" in result.stdout
+    assert "Added driver fields: none" in result.stdout
     assert "DRY RUN: no files were modified." in result.stdout
