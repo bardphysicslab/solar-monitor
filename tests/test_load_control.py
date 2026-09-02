@@ -305,6 +305,70 @@ class LoadControlTest(unittest.TestCase):
         self.assertEqual(load.state()["safety_state"], "instrument_error")
         self.assertFalse(load.state()["input_enabled"])
 
+    def test_failed_off_is_latched_as_disconnected_and_unconfirmed(self):
+        driver = FakeLoad([
+            measurement(current=0, power=0, resistance=1370),
+            measurement(resistance=1370),
+        ])
+        load = controller(driver=driver)
+        load.enable_fixed()
+        driver.input_off = lambda: (_ for _ in ()).throw(OSError(6, "Device not configured"))
+
+        with self.assertRaises(OSError):
+            load.disable()
+
+        state = load.state()
+        self.assertEqual(state["safety_state"], "disconnected_unconfirmed")
+        self.assertTrue(state["input_enabled"])
+        self.assertIsNone(state["active_mode"])
+
+    def test_recovery_confirms_off_without_resuming_previous_mode(self):
+        driver = FakeLoad([measurement()])
+        confirmed = []
+        driver.ensure_safe_off = lambda: confirmed.append("off-confirmed")
+        load = controller(driver=driver)
+        load.safety_state = "disconnected_unconfirmed"
+        load.safety_message = "ET54 USB disconnected; load OFF could not be confirmed"
+        load.active_mode = None
+        load.input_enabled = True
+        load.sweep_run_mode = "continuous"
+        load.sweep_run_active = False
+
+        reading = load.poll_reading()
+
+        self.assertEqual(reading["status"], "ok")
+        self.assertEqual(confirmed, ["off-confirmed"])
+        state = load.state()
+        self.assertEqual(state["safety_state"], "ready")
+        self.assertFalse(state["input_enabled"])
+        self.assertIsNone(state["active_mode"])
+        self.assertFalse(state["sweep_run_active"])
+
+    def test_disconnect_during_sweep_preserves_points_and_leaves_off_unconfirmed(self):
+        driver = FakeLoad([
+            measurement(current=0, power=0, resistance=1200),
+            measurement(voltage=16, current=0.01, resistance=1200),
+        ])
+        off_calls = 0
+
+        def fail_final_off():
+            nonlocal off_calls
+            off_calls += 1
+            if off_calls > 1:
+                raise OSError(6, "Device not configured")
+            driver.input_enabled = False
+
+        driver.input_off = fail_final_off
+        driver.on_measure = lambda count: setattr(driver, "raise_on_measure", OSError(6, "Device not configured")) if count == 3 else None
+        load = controller(driver=driver)
+
+        result = load.run_sweep()
+
+        self.assertEqual(result["electrical_status"], "instrument_error")
+        self.assertEqual(len(result["points"]), 1)
+        self.assertEqual(load.state()["safety_state"], "disconnected_unconfirmed")
+        self.assertTrue(load.state()["input_enabled"])
+
     def test_sweep_high_to_low_preserves_points_and_selects_computed_mpp(self):
         driver = FakeLoad([
             measurement(voltage=20, current=0, power=0, resistance=1200),
@@ -325,6 +389,7 @@ class LoadControlTest(unittest.TestCase):
         self.assertEqual(result["rmpp_ohm"], 1000)
         self.assertEqual(result["irradiance"]["mean_w_m2"], 500)
         self.assertEqual(saved, [result])
+        self.assertIs(load.state()["last_successful_sweep"], result)
         self.assertEqual(driver.commands[-1], "off")
 
     def test_sweep_rejects_low_to_high_before_energizing(self):
@@ -346,6 +411,7 @@ class LoadControlTest(unittest.TestCase):
         load = controller(driver=driver)
         result = load.run_sweep()
         self.assertEqual(result["quality"], "safety_abort")
+        self.assertIsNone(load.state()["last_successful_sweep"])
         self.assertEqual(len(result["points"]), 2)
         self.assertNotIn("resistance:800", driver.commands)
         self.assertEqual(driver.commands[-1], "off")
@@ -378,6 +444,19 @@ class LoadControlTest(unittest.TestCase):
         self.assertEqual(incomplete["electrical_status"], "complete")
         self.assertEqual(incomplete["irradiance_status"], "unavailable")
         self.assertEqual(incomplete["quality"], "irradiance_unavailable")
+        self.assertIsNotNone(incomplete["vmpp_v"])
+
+    def test_failed_sweep_preserves_previous_successful_sweep(self):
+        driver = FakeLoad([measurement(current=0, power=0), measurement(), measurement(), measurement()])
+        load = controller(driver=driver)
+        successful = load.run_sweep()
+        driver.raise_on_measure = OSError("serial disconnected")
+
+        failed = load.run_sweep()
+
+        self.assertEqual(failed["electrical_status"], "instrument_error")
+        self.assertIs(load.state()["last_sweep"], failed)
+        self.assertIs(load.state()["last_successful_sweep"], successful)
 
     def test_single_shot_runs_once_and_leaves_input_off(self):
         driver = FakeLoad([measurement(current=0, power=0), measurement(), measurement(), measurement()])
@@ -406,6 +485,34 @@ class LoadControlTest(unittest.TestCase):
         self.assertAlmostEqual(clock.waits[0], 0.1)
         self.assertEqual(load.state()["sweep_timing_stats"]["skipped_boundary_count"], 0)
         self.assertEqual(results[0]["timing_status"], "on_time")
+
+    def test_continuous_successive_sweeps_replace_successful_mpp_atomically(self):
+        clock = FakeClock()
+        driver = FakeLoad([
+            measurement(current=0, power=0),
+            measurement(voltage=16, current=0.01, resistance=1200),
+            measurement(voltage=15, current=0.02, resistance=1000),
+            measurement(voltage=14, current=0.01, resistance=800),
+            measurement(current=0, power=0),
+            measurement(voltage=15, current=0.01, resistance=1200),
+            measurement(voltage=14, current=0.02, resistance=1000),
+            measurement(voltage=13, current=0.03, resistance=800),
+        ])
+        saved = []
+        load = controller(driver=driver, monotonic_fn=clock.monotonic, wait_fn=clock.wait)
+
+        def retain_and_stop(result):
+            saved.append(result)
+            if len(saved) == 2:
+                load.disable()
+
+        load.sweep_result_sink = retain_and_stop
+        results = load.run_sweep_sequence("continuous")
+
+        self.assertEqual(len(results), 2)
+        self.assertEqual((results[0]["vmpp_v"], results[0]["impp_a"], results[0]["rmpp_ohm"]), (15, 0.02, 1000))
+        self.assertEqual((results[1]["vmpp_v"], results[1]["impp_a"], results[1]["rmpp_ohm"]), (13, 0.03, 800))
+        self.assertIs(load.state()["last_successful_sweep"], results[1])
 
     def test_continuous_overrun_is_retained_and_resumes_next_future_boundary(self):
         clock = FakeClock()

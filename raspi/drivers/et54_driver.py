@@ -1,20 +1,25 @@
 from contextlib import contextmanager
 from datetime import datetime, timezone
 import math
+import logging
+import os
 import threading
 import time
 from typing import Callable, Iterable, Optional
 
 try:
     import serial
+    from serial.tools import list_ports
 except ImportError:
     serial = None
+    list_ports = None
 
 
 CHANNELS = ("voltage_v", "current_a", "power_w", "load_resistance_ohm")
 ACKNOWLEDGMENT = "execu success"
 COMMAND_ERROR = "cmd err"
 UNAVAILABLE_RESISTANCE_SENTINEL_OHM = 99999999.0
+logger = logging.getLogger(__name__)
 
 
 class ET54Error(RuntimeError):
@@ -39,17 +44,30 @@ class ET54Driver:
         resistance_ohm: float = 100.0,
         timeout_s: float = 1.0,
         serial_factory: Optional[Callable[..., object]] = None,
+        port_lister: Optional[Callable[[], Iterable[object]]] = None,
+        reconnect_interval_s: float = 5.0,
+        monotonic_fn: Callable[[], float] = time.monotonic,
     ):
         self.uid = uid
+        self.configured_port = port
         self.port = port
         self.baud = int(baud)
         self.mode = str(mode).upper()
         self.resistance_ohm = self._validate_resistance(resistance_ohm)
         self.timeout_s = float(timeout_s)
         self._serial_factory = serial_factory
+        self._port_lister = port_lister
         self._instrument = None
         self._lock = threading.RLock()
         self._last_seen = None
+        self._monotonic = monotonic_fn
+        self._reconnect_interval_s = max(0.0, float(reconnect_interval_s))
+        self._last_reconnect_attempt = None
+        self.transport_state = "disconnected"
+        self.transport_message = "ET54 USB disconnected"
+        self._identity_required = serial_factory is None
+        self.requires_safe_off_confirmation = self._identity_required
+        self.safe_off_confirmed = False
 
         if self.mode != "CR":
             raise ValueError("ET54 currently supports only CR mode")
@@ -69,7 +87,10 @@ class ET54Driver:
             "transport": "usb_serial",
             "protocol": "ET54 serial commands",
             "port": self.port,
+            "configured_port": self.configured_port,
             "baud": self.baud,
+            "transport_state": self.transport_state,
+            "transport_message": self.transport_message,
             "configured_mode": self.mode,
             "resistance_setpoint_ohm": resistance_setpoint_ohm,
         }
@@ -145,9 +166,23 @@ class ET54Driver:
 
     def input_on(self) -> None:
         self._set("CH:SW ON")
+        self.safe_off_confirmed = False
 
     def input_off(self) -> None:
         self._set("CH:SW OFF")
+
+    def ensure_safe_off(self) -> None:
+        if self._instrument is None or self._identity_required:
+            self._reconnect(force=True)
+            if self.safe_off_confirmed:
+                return
+        self.input_off()
+        if self.input_state():
+            raise ET54ProtocolError("ET54 input remained ON after CH:SW OFF")
+        self.transport_state = "connected"
+        self.transport_message = "ET54 connected; load confirmed OFF"
+        self.requires_safe_off_confirmation = False
+        self.safe_off_confirmed = True
 
     def measure_all(self) -> dict:
         raw = self._query("MEAS:ALL?")
@@ -242,14 +277,22 @@ class ET54Driver:
         }
 
     def _query(self, command: str) -> str:
-        return self._strip_response_prefix(self._exchange(command))
+        if self._identity_required:
+            self._reconnect()
+        try:
+            return self._strip_response_prefix(self._exchange_once(command))
+        except ET54TransportError:
+            self._reconnect()
+            return self._strip_response_prefix(self._exchange_once(command))
 
     def _set(self, command: str) -> None:
-        response = self._strip_response_prefix(self._exchange(command))
+        if self._identity_required:
+            raise ET54TransportError("ET54 identity must be reverified before state-changing commands")
+        response = self._strip_response_prefix(self._exchange_once(command))
         if response.lower() != ACKNOWLEDGMENT:
             raise ET54ProtocolError(f"Unexpected acknowledgment for {command}: {response!r}")
 
-    def _exchange(self, command: str) -> str:
+    def _exchange_once(self, command: str) -> str:
         with self._lock:
             try:
                 instrument = self._open()
@@ -257,16 +300,16 @@ class ET54Driver:
                 if hasattr(instrument, "flush"):
                     instrument.flush()
                 response = instrument.readline()
-            except Exception as exc:
-                self._close()
+            except self._transport_exception_types() as exc:
+                self._invalidate_transport(exc)
                 raise ET54TransportError(f"ET54 serial command failed ({command}): {exc}") from exc
 
             if not response:
-                self._close()
+                self._invalidate_transport()
                 raise ET54TransportError(f"ET54 did not respond to {command}")
             text = response.decode("ascii", errors="replace").strip()
             if not text:
-                self._close()
+                self._invalidate_transport()
                 raise ET54TransportError(f"ET54 returned an empty response to {command}")
             if COMMAND_ERROR in self._strip_response_prefix(text).lower():
                 raise ET54ProtocolError(f"ET54 rejected command {command}: {text}")
@@ -298,7 +341,96 @@ class ET54Driver:
         self._instrument = factory(**kwargs)
         if hasattr(self._instrument, "reset_input_buffer"):
             self._instrument.reset_input_buffer()
+        self.transport_state = "connected"
+        self.transport_message = "ET54 USB connected"
         return self._instrument
+
+    def _reconnect(self, force: bool = False) -> None:
+        with self._lock:
+            now = self._monotonic()
+            if not force and self._last_reconnect_attempt is not None and now - self._last_reconnect_attempt < self._reconnect_interval_s:
+                raise ET54TransportError("ET54 reconnect is waiting for the bounded retry interval")
+            self._last_reconnect_attempt = now
+            self.transport_state = "reconnecting"
+            self.transport_message = "Reconnecting to ET5406A+"
+            self._close()
+            candidates = self._candidate_ports()
+            if not candidates:
+                self._invalidate_transport()
+                raise ET54TransportError("No matching ET5406A+ USB serial device found")
+            if len(candidates) > 1:
+                self._invalidate_transport()
+                raise ET54TransportError("Multiple matching ET5406A+ USB serial devices found; reconnect is ambiguous")
+            candidate = candidates[0]
+            previous_port = self.port
+            self.port = candidate
+            try:
+                self._open()
+                identity = self._strip_response_prefix(self._exchange_once("*IDN?"))
+                if "ET5406A+" not in identity.upper():
+                    raise ET54ProtocolError(f"Unexpected USB serial device identity: {identity!r}")
+                self._identity_required = False
+                off_response = self._strip_response_prefix(self._exchange_once("CH:SW OFF"))
+                if off_response.lower() != ACKNOWLEDGMENT:
+                    raise ET54ProtocolError(f"Unexpected acknowledgment for CH:SW OFF: {off_response!r}")
+                input_response = self._strip_response_prefix(self._exchange_once("CH:SW?"))
+                if input_response.strip().upper() not in {"OFF", "0"}:
+                    raise ET54ProtocolError(f"ET54 input OFF could not be confirmed: {input_response!r}")
+            except self._transport_exception_types() as exc:
+                self._close()
+                self.port = previous_port
+                self.transport_state = "fault"
+                self.transport_message = "ET54 identity verification failed"
+                raise ET54TransportError(f"Could not reconnect to ET5406A+: {exc}") from exc
+            except (ET54TransportError, ET54ProtocolError):
+                self._close()
+                self.port = previous_port
+                self.transport_state = "fault"
+                self.transport_message = "ET54 identity verification failed"
+                raise
+            self.transport_state = "connected"
+            self.transport_message = "ET54 reconnected; load confirmed OFF"
+            self._identity_required = False
+            self.requires_safe_off_confirmation = False
+            self.safe_off_confirmed = True
+
+    def _candidate_ports(self) -> list:
+        if self._serial_factory is not None and self._port_lister is None:
+            return [self.configured_port]
+        configured_exists = bool(self.configured_port and os.path.exists(self.configured_port))
+        if configured_exists:
+            return [self.configured_port]
+        lister = self._port_lister or (list_ports.comports if list_ports is not None else None)
+        if lister is None:
+            return []
+        matches = []
+        for item in lister():
+            device = getattr(item, "device", None)
+            description = " ".join(
+                str(value or "") for value in (getattr(item, "description", ""), getattr(item, "manufacturer", ""), getattr(item, "product", ""))
+            ).upper()
+            vid = getattr(item, "vid", None)
+            pid = getattr(item, "pid", None)
+            known_ch340 = vid == 0x1A86 and pid in {0x5523, 0x7523}
+            if device and (known_ch340 or "CH340" in description or "USB-SERIAL" in description):
+                matches.append(device)
+        return sorted(set(matches))
+
+    def _invalidate_transport(self, exc: Optional[BaseException] = None) -> None:
+        if exc is not None:
+            logger.warning("ET54 USB transport invalidated: %s", exc)
+        self._close()
+        self._identity_required = True
+        self.requires_safe_off_confirmation = True
+        self.safe_off_confirmed = False
+        self.transport_state = "disconnected"
+        self.transport_message = "ET54 USB disconnected"
+
+    @staticmethod
+    def _transport_exception_types():
+        if serial is None:
+            return (OSError,)
+        return (OSError, serial.SerialException)
 
     def _close(self) -> None:
         if self._instrument is None:

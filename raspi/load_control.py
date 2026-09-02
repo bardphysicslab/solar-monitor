@@ -177,6 +177,7 @@ class ElectronicLoadController:
         self.safety_message = "Load disabled"
         self.sweep_state = "idle"
         self.last_sweep = None
+        self.last_successful_sweep = None
         self.last_measurement = None
         self._stop_requested = threading.Event()
         self.wait_fn = wait_fn or self._stop_requested.wait
@@ -194,7 +195,7 @@ class ElectronicLoadController:
             self.safety_state = "unavailable"
             self.safety_message = str(exc)
         else:
-            if self.safety_state not in {"active", "safety_fault", "instrument_error", "sweep_running"}:
+            if self.safety_state not in {"active", "safety_fault", "instrument_error", "disconnected_unconfirmed", "sweep_running"}:
                 self.safety_state = "ready"
                 self.safety_message = "Safety configuration complete"
 
@@ -238,6 +239,8 @@ class ElectronicLoadController:
                 "input_enabled": self.input_enabled,
                 "safety_state": self.safety_state,
                 "safety_message": self.safety_message,
+                "transport_state": getattr(self.driver, "transport_state", "connected"),
+                "transport_message": getattr(self.driver, "transport_message", None),
                 "resistance_setpoint_ohm": self.selected_resistance_ohm,
                 "applied_resistance_ohm": self.applied_resistance_ohm,
                 "sweep_state": self.sweep_state,
@@ -246,6 +249,7 @@ class ElectronicLoadController:
                 "sweep_timing_stats": self.sweep_timing_stats(),
                 "last_measurement": self.last_measurement,
                 "last_sweep": self.last_sweep,
+                "last_successful_sweep": self.last_successful_sweep,
                 "safety_config_complete": config_complete,
                 "safety_config_error": config_error,
                 "effective_limits": envelope,
@@ -326,13 +330,13 @@ class ElectronicLoadController:
 
     def enable_fixed(self) -> Dict[str, Any]:
         with self._lock:
-            if self.active_mode is not None or self.safety_state in {"safety_fault", "instrument_error"}:
+            if self.active_mode is not None or self.safety_state in {"safety_fault", "instrument_error", "disconnected_unconfirmed"}:
                 raise LoadControlError("Load must be disabled and fault-cleared before enabling")
             envelope = self.safety_envelope("fixed_resistance")
             self._validate_resistance(self.selected_resistance_ohm, envelope=envelope)
             try:
                 with self.driver.operation():
-                    self.driver.input_off()
+                    self._confirm_driver_off()
                     self.driver.get_mode()
                     self.driver.input_state()
                     self.driver.set_mode_cr()
@@ -406,6 +410,24 @@ class ElectronicLoadController:
             if reading.get("status") == "ok":
                 measurement = reading.get("data") or {}
                 self.last_measurement = measurement
+                driver_confirmed_off = getattr(self.driver, "safe_off_confirmed", False)
+                if self.safety_state == "disconnected_unconfirmed" and driver_confirmed_off:
+                    self.input_enabled = False
+                    self.active_mode = None
+                    self.safety_state = "ready"
+                    self.safety_message = "ET54 reconnected; load confirmed OFF"
+                recovery_requires_off = (
+                    self.safety_state == "disconnected_unconfirmed"
+                    or getattr(self.driver, "requires_safe_off_confirmation", False)
+                )
+                if recovery_requires_off:
+                    try:
+                        self._safe_off()
+                    except Exception as exc:
+                        reading = self._fault_reading(reading, f"ET54 reconnected but OFF could not be confirmed: {exc}")
+                    else:
+                        self.safety_state = "ready"
+                        self.safety_message = "ET54 reconnected; load confirmed OFF"
                 if self.active_mode == "fixed_resistance" and self.input_enabled:
                     try:
                         self._validate_measurement(measurement, self.safety_envelope("fixed_resistance"))
@@ -417,12 +439,17 @@ class ElectronicLoadController:
                     self._refresh_readiness()
             else:
                 error = reading.get("message") or (reading.get("extended") or {}).get("error") or "ET54 reading failed"
+                user_message = (
+                    getattr(self.driver, "transport_message", None)
+                    if reading.get("status") == "node_unavailable"
+                    else None
+                ) or error
                 if self.active_mode is not None or self.input_enabled:
                     self._safe_off()
-                    self._latch_fault("instrument_error", error)
+                    self._latch_fault("instrument_error", user_message)
                 elif self.safety_state not in {"safety_fault", "instrument_error"}:
                     self.safety_state = "unavailable"
-                    self.safety_message = error
+                    self.safety_message = user_message
             self._add_provenance(reading)
             return reading
 
@@ -452,7 +479,7 @@ class ElectronicLoadController:
         preserve_stop_request: bool = False,
     ) -> Dict[str, Any]:
         with self._lock:
-            if self.active_mode is not None or self.safety_state in {"safety_fault", "instrument_error"}:
+            if self.active_mode is not None or self.safety_state in {"safety_fault", "instrument_error", "disconnected_unconfirmed"}:
                 raise LoadControlError("Load must be disabled and fault-cleared before sweep")
             envelope, values, settle_s = self.validate_sweep_configuration()
             self.selected_mode = "sweep"
@@ -472,10 +499,11 @@ class ElectronicLoadController:
         points: List[Dict[str, Any]] = []
         electrical_status = "complete"
         reason = None
+        off_confirmed = False
         previous = None
         try:
             with self.driver.operation():
-                self.driver.input_off()
+                self._confirm_driver_off()
                 self.driver.get_mode()
                 self.driver.input_state()
                 self.driver.set_mode_cr()
@@ -515,11 +543,11 @@ class ElectronicLoadController:
             reason = str(exc)
         finally:
             try:
-                self.driver.input_off()
+                self._confirm_driver_off()
+                off_confirmed = True
             except Exception as exc:
-                if reason is None:
-                    electrical_status = "instrument_error"
-                    reason = f"Could not confirm input OFF: {exc}"
+                electrical_status = "instrument_error"
+                reason = f"Could not confirm input OFF: {exc}"
 
         completed_at = utc_timestamp()
         completed_monotonic = self.monotonic_fn()
@@ -576,13 +604,17 @@ class ElectronicLoadController:
         with self._lock:
             self.last_sweep = result
             if electrical_status == "complete":
+                self.last_successful_sweep = result
                 self._sweep_durations.append(duration_s)
                 if timing_status == "overrun":
                     self.overrun_count += 1
             self.active_mode = None
-            self.input_enabled = False
+            self.input_enabled = not off_confirmed
             self.sweep_state = "completed" if electrical_status == "complete" else "aborted"
-            if electrical_status == "safety_abort":
+            if not off_confirmed:
+                self.safety_state = "disconnected_unconfirmed"
+                self.safety_message = "ET54 USB disconnected; load OFF could not be confirmed"
+            elif electrical_status == "safety_abort":
                 self._latch_fault("safety_fault", reason or "Sweep safety abort")
             elif electrical_status == "instrument_error":
                 self._latch_fault("instrument_error", reason or "Sweep instrument error")
@@ -644,14 +676,16 @@ class ElectronicLoadController:
                 boundary_index = next_index
         finally:
             try:
-                self.driver.input_off()
+                self._confirm_driver_off()
             except Exception as exc:
                 with self._lock:
-                    if self.safety_state != "safety_fault":
-                        self._latch_fault("instrument_error", f"Could not confirm input OFF: {exc}")
+                    self.safety_state = "disconnected_unconfirmed"
+                    self.safety_message = "ET54 USB disconnected; load OFF could not be confirmed"
+                    self.input_enabled = True
             finally:
                 with self._lock:
-                    self.input_enabled = False
+                    if self.safety_state != "disconnected_unconfirmed":
+                        self.input_enabled = False
                     self.active_mode = None
                     self.sweep_run_active = False
         return results
@@ -678,10 +712,23 @@ class ElectronicLoadController:
 
     def _safe_off(self) -> None:
         try:
-            self.driver.input_off()
-        finally:
+            self._confirm_driver_off()
+        except Exception as exc:
+            self.safety_state = "disconnected_unconfirmed"
+            self.safety_message = "ET54 USB disconnected; load OFF could not be confirmed"
+            self.active_mode = None
+            self.input_enabled = True
+            raise exc
+        else:
             self.input_enabled = False
             self.active_mode = None
+
+    def _confirm_driver_off(self) -> None:
+        ensure_safe_off = getattr(self.driver, "ensure_safe_off", None)
+        if ensure_safe_off is not None:
+            ensure_safe_off()
+        else:
+            self.driver.input_off()
 
     def _latch_fault(self, state: str, message: str) -> None:
         self.safety_state = state

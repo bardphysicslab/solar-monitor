@@ -38,6 +38,7 @@ templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
 
 run_active = False
 latest_readings_by_uid: Dict[str, Dict[str, Any]] = {}
+latest_successful_readings_by_uid: Dict[str, Dict[str, Any]] = {}
 last_recorded_signatures_by_uid: Dict[str, str] = {}
 state_lock = threading.Lock()
 sync_status_lock = threading.Lock()
@@ -345,6 +346,8 @@ configure_initial_spn1_sync_status()
 def set_latest_reading(uid: str, reading: Dict[str, Any]) -> None:
     with state_lock:
         latest_readings_by_uid[uid] = reading
+        if reading.get("status") == "ok":
+            latest_successful_readings_by_uid[uid] = reading
 
 
 def reading_signature(reading: Dict[str, Any]) -> str:
@@ -434,12 +437,13 @@ def drivers_due_for_polling(drivers: List[Any], run_is_active: bool) -> List[Any
         if controller is None:
             continue
         state = controller.state()
-        if state.get("input_enabled") and state.get("sweep_state") != "running":
+        transport_needs_recovery = state.get("transport_state") in {"disconnected", "reconnecting", "fault"}
+        if (state.get("input_enabled") or transport_needs_recovery) and state.get("sweep_state") != "running":
             due.append(driver)
     return due
 
 
-def generic_polling_loop(stop_event: threading.Event = shutdown_event, poll_interval_s: float = 1.0) -> None:
+def generic_polling_loop(stop_event: threading.Event = shutdown_event, poll_interval_s: float = 10.0) -> None:
     drivers = polled_drivers()
     while not stop_event.is_set():
         run_is_active = is_run_active()
@@ -449,8 +453,10 @@ def generic_polling_loop(stop_event: threading.Event = shutdown_event, poll_inte
                 if stop_event.is_set():
                     break
                 controller = LOAD_CONTROLLERS.get(getattr(driver, "uid", ""))
-                if controller is not None and controller.state()["sweep_state"] == "running":
-                    continue
+                if controller is not None:
+                    controller_state = controller.state()
+                    if controller_state["sweep_state"] == "running" or controller_state.get("sweep_run_active"):
+                        continue
                 poll_driver_once(driver, record=run_is_active)
             stop_event.wait(poll_interval_s)
         else:
@@ -706,13 +712,38 @@ def get_loads():
 def load_state_payload(controller: ElectronicLoadController) -> Dict[str, Any]:
     state = controller.state()
     with state_lock:
-        reading = latest_readings_by_uid.get(controller.uid)
+        latest_attempt = latest_readings_by_uid.get(controller.uid)
+        successful_reading = latest_successful_readings_by_uid.get(controller.uid)
     channels = ("voltage_v", "current_a", "power_w", "load_resistance_ohm")
-    live_reading = {channel: None for channel in channels}
-    if reading is not None and reading.get("status") == "ok":
-        data = reading.get("data") or {}
+    live_reading = None
+    if successful_reading is not None:
+        data = successful_reading.get("data") or {}
         live_reading = {channel: data.get(channel) for channel in channels}
+    successful_sweep = state.get("last_successful_sweep")
+    sweep_reading = None
+    if successful_sweep is not None:
+        sweep_reading = {
+            "voltage_v": successful_sweep.get("vmpp_v"),
+            "current_a": successful_sweep.get("impp_a"),
+            "power_w": successful_sweep.get("pmpp_w"),
+            "load_resistance_ohm": successful_sweep.get("rmpp_ohm"),
+        }
+    use_sweep = state.get("selected_mode") == "sweep" and sweep_reading is not None
     state["live_reading"] = live_reading
+    state["panel_reading"] = sweep_reading if use_sweep else live_reading
+    state["panel_reading_source"] = "sweep_mpp" if use_sweep else ("et54_poll" if live_reading is not None else None)
+    state["poll_status"] = latest_attempt.get("status") if latest_attempt is not None else None
+    poll_diagnostic = (
+        (latest_attempt.get("extended") or {}).get("error")
+        if latest_attempt is not None and latest_attempt.get("status") != "ok"
+        else None
+    )
+    state["poll_error"] = (
+        state.get("transport_message")
+        if poll_diagnostic and state.get("transport_state") in {"disconnected", "reconnecting", "fault"}
+        else poll_diagnostic
+    )
+    state["poll_diagnostic"] = poll_diagnostic
     return state
 
 

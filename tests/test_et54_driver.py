@@ -1,6 +1,7 @@
 import unittest
+from types import SimpleNamespace
 
-from raspi.drivers.et54_driver import ET54Driver, ET54ProtocolError
+from raspi.drivers.et54_driver import ET54Driver, ET54ProtocolError, ET54TransportError
 
 
 class FakeSerial:
@@ -149,11 +150,135 @@ class ET54DriverTest(unittest.TestCase):
         self.assertTrue(all(value is None for value in reading["data"].values()))
 
     def test_transport_failure_returns_unavailable_and_resets_connection(self):
-        driver, fake = make_driver([OSError("disconnected")])
+        stale = FakeSerial([OSError(6, "Device not configured")])
+        replacement = FakeSerial([
+            "REast Tester,ET5406A+\n", "Rexecu success\n", "ROFF\n",
+            OSError(6, "Device not configured"),
+        ])
+        connections = iter([stale, replacement])
+        driver = ET54Driver(
+            uid="bb-solar-load-001",
+            port="/dev/fake-et54",
+            serial_factory=lambda **_kwargs: next(connections),
+            reconnect_interval_s=0,
+        )
         reading = driver.get_reading()
         self.assertEqual(reading["status"], "node_unavailable")
         self.assertTrue(all(value is None for value in reading["data"].values()))
-        self.assertFalse(fake.is_open)
+        self.assertFalse(stale.is_open)
+        self.assertFalse(replacement.is_open)
+        self.assertIsNone(driver._instrument)
+
+    def test_read_only_query_reconnects_once_with_identity_check(self):
+        stale = FakeSerial([OSError(6, "Device not configured")])
+        replacement = FakeSerial([
+            "REast Tester,ET5406A+\n", "Rexecu success\n", "ROFF\n",
+            "R 0.010 16.245 0.16 1680\n",
+        ])
+        opened = []
+
+        def factory(**_kwargs):
+            connection = [stale, replacement][len(opened)]
+            opened.append(connection)
+            return connection
+
+        driver = ET54Driver("load-001", "/dev/cu.old", serial_factory=factory, reconnect_interval_s=0)
+        self.assertEqual(driver.measure_all()["load_resistance_ohm"], 1680)
+        self.assertEqual(len(opened), 2)
+        self.assertFalse(stale.is_open)
+        self.assertIs(driver._instrument, replacement)
+        self.assertEqual(replacement.writes, ["*IDN?\n", "CH:SW OFF\n", "CH:SW?\n", "MEAS:ALL?\n"])
+
+    def test_read_only_retry_is_bounded(self):
+        stale = FakeSerial([OSError(6, "Device not configured")])
+        replacement = FakeSerial([
+            "REast Tester,ET5406A+\n", "Rexecu success\n", "ROFF\n",
+            OSError(6, "Device not configured"),
+        ])
+        opened = []
+
+        def factory(**_kwargs):
+            connection = [stale, replacement][len(opened)]
+            opened.append(connection)
+            return connection
+
+        driver = ET54Driver("load-001", "/dev/cu.old", serial_factory=factory, reconnect_interval_s=0)
+        with self.assertRaises(ET54TransportError):
+            driver.measure_all()
+        self.assertEqual(len(opened), 2)
+
+    def test_input_on_is_not_replayed_after_transport_failure(self):
+        stale = FakeSerial([OSError(6, "Device not configured")])
+        open_count = 0
+
+        def factory(**_kwargs):
+            nonlocal open_count
+            open_count += 1
+            return stale
+
+        driver = ET54Driver("load-001", "/dev/cu.old", serial_factory=factory)
+        with self.assertRaises(ET54TransportError):
+            driver.input_on()
+        self.assertEqual(stale.writes, ["CH:SW ON\n"])
+        self.assertEqual(open_count, 1)
+
+    def test_reconnect_rejects_wrong_identity(self):
+        stale = FakeSerial([OSError(6, "Device not configured")])
+        wrong = FakeSerial(["ROther Vendor,Power Supply\n"])
+        connections = iter([stale, wrong])
+        driver = ET54Driver(
+            "load-001", "/dev/cu.old", serial_factory=lambda **_kwargs: next(connections), reconnect_interval_s=0
+        )
+        reading = driver.get_reading()
+        self.assertEqual(reading["status"], "error")
+        self.assertEqual(driver.transport_state, "fault")
+        self.assertFalse(wrong.is_open)
+
+    def test_changed_port_is_rediscovered_and_identity_verified(self):
+        stale = FakeSerial([OSError(6, "Device not configured")])
+        replacement = FakeSerial([
+            "REast Tester,ET5406A+\n", "Rexecu success\n", "ROFF\n",
+            "R 0.010 16.245 0.16 1680\n",
+        ])
+        opened_ports = []
+
+        def factory(**kwargs):
+            opened_ports.append(kwargs["port"])
+            return stale if kwargs["port"] == "/dev/cu.old" else replacement
+
+        ports = lambda: [SimpleNamespace(device="/dev/cu.new", vid=0x1A86, pid=0x7523, description="CH340")]
+        driver = ET54Driver(
+            "load-001", "/dev/cu.old", serial_factory=factory, port_lister=ports, reconnect_interval_s=0
+        )
+        self.assertEqual(driver.measure_all()["current_a"], 0.010)
+        self.assertEqual(driver.port, "/dev/cu.new")
+        self.assertEqual(opened_ports, ["/dev/cu.old", "/dev/cu.new"])
+
+    def test_ambiguous_rediscovery_does_not_guess(self):
+        stale = FakeSerial([OSError(6, "Device not configured")])
+        ports = lambda: [
+            SimpleNamespace(device="/dev/cu.a", vid=0x1A86, pid=0x7523, description="CH340"),
+            SimpleNamespace(device="/dev/cu.b", vid=0x1A86, pid=0x7523, description="CH340"),
+        ]
+        driver = ET54Driver(
+            "load-001", "/dev/cu.old", serial_factory=lambda **_kwargs: stale,
+            port_lister=ports, reconnect_interval_s=0,
+        )
+        reading = driver.get_reading()
+        self.assertEqual(reading["status"], "node_unavailable")
+        self.assertIn("ambiguous", reading["message"])
+        self.assertEqual(driver.port, "/dev/cu.old")
+
+    def test_safe_off_reconnects_verifies_identity_and_confirms_off(self):
+        connection = FakeSerial([
+            "REast Tester,ET5406A+\n",
+            "Rexecu success\n",
+            "ROFF\n",
+        ])
+        driver = ET54Driver("load-001", "/dev/cu.et54", serial_factory=lambda **_kwargs: connection)
+        driver.ensure_safe_off()
+        self.assertEqual(connection.writes, ["*IDN?\n", "CH:SW OFF\n", "CH:SW?\n"])
+        self.assertEqual(driver.transport_message, "ET54 reconnected; load confirmed OFF")
 
     def test_sweep_ordering_and_result_collection(self):
         responses = [

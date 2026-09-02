@@ -13,7 +13,7 @@ class SolarNodeTemplateTest(unittest.TestCase):
         self.assertIn('detailRow("Voltage", formatNumber(panelReadings.voltage_v', TEMPLATE)
         self.assertIn('detailRow("Current", formatNumber(panelReadings.current_a', TEMPLATE)
         self.assertIn('detailRow("Power", formatNumber(panelReadings.power_w', TEMPLATE)
-        self.assertIn("const measurement = load.live_reading || load.last_measurement || {};", TEMPLATE)
+        self.assertIn("const measurement = load.panel_reading || {};", TEMPLATE)
         panel_function = TEMPLATE[
             TEMPLATE.index("function panelReadingValues"):
             TEMPLATE.index("function mergeSolarNodes")
@@ -148,9 +148,15 @@ class SolarNodeTemplateTest(unittest.TestCase):
 
     def test_effective_resistance_requires_enabled_input(self):
         self.assertIn(
-            "state.input_enabled ? formatResistance((state.live_reading || state.last_measurement)?.load_resistance_ohm) : null",
+            "state.input_enabled ? formatResistance(state.panel_reading?.load_resistance_ohm) : null",
             TEMPLATE,
         )
+
+    def test_poll_failure_is_rendered_separately_from_panel_values(self):
+        self.assertIn('detailRow("Poll status", state.poll_status || "Waiting")', TEMPLATE)
+        self.assertIn('state.poll_error ? detailRow("Poll error", state.poll_error)', TEMPLATE)
+        self.assertIn('detailRow("Transport", state.transport_state || "disconnected")', TEMPLATE)
+        self.assertIn('"Unknown (OFF unconfirmed)"', TEMPLATE)
 
     def test_resistance_format_uses_ohm_symbols(self):
         self.assertIn("function formatResistance(valueOhm)", TEMPLATE)

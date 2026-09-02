@@ -1,4 +1,5 @@
 import json
+import inspect
 import os
 import threading
 import time
@@ -49,6 +50,7 @@ class MainMultiDeviceTest(unittest.TestCase):
         self.original_primary = main.PRIMARY_DRIVER
         self.original_run_active = main.run_active
         self.original_readings = dict(main.latest_readings_by_uid)
+        self.original_successful_readings = dict(main.latest_successful_readings_by_uid)
         self.original_signatures = dict(main.last_recorded_signatures_by_uid)
         self.original_recorder = main.RECORDER
         self.original_backup_manager = main.BACKUP_MANAGER
@@ -87,6 +89,7 @@ class MainMultiDeviceTest(unittest.TestCase):
         main.DRIVERS = [self.spn1, self.wifi]
         main.PRIMARY_DRIVER = self.spn1
         main.latest_readings_by_uid = {}
+        main.latest_successful_readings_by_uid = {}
         main.last_recorded_signatures_by_uid = {}
         main.run_active = False
         main.RECORDER = FakeRecorder()
@@ -98,6 +101,7 @@ class MainMultiDeviceTest(unittest.TestCase):
         main.PRIMARY_DRIVER = self.original_primary
         main.run_active = self.original_run_active
         main.latest_readings_by_uid = self.original_readings
+        main.latest_successful_readings_by_uid = self.original_successful_readings
         main.last_recorded_signatures_by_uid = self.original_signatures
         main.RECORDER = self.original_recorder
         main.BACKUP_MANAGER = self.original_backup_manager
@@ -127,6 +131,25 @@ class MainMultiDeviceTest(unittest.TestCase):
 
     def test_application_does_not_schedule_backup_loop(self):
         self.assertFalse(hasattr(main, "backup_loop"))
+
+    def test_generic_background_measurement_cadence_is_ten_seconds(self):
+        self.assertEqual(inspect.signature(main.generic_polling_loop).parameters["poll_interval_s"].default, 10.0)
+
+    def test_disconnected_configured_load_is_due_for_bounded_background_reconnect(self):
+        class Driver:
+            uid = "load-001"
+
+        class Controller:
+            def state(self):
+                return {
+                    "input_enabled": False,
+                    "sweep_state": "idle",
+                    "transport_state": "disconnected",
+                }
+
+        driver = Driver()
+        main.LOAD_CONTROLLERS = {driver.uid: Controller()}
+        self.assertEqual(main.drivers_due_for_polling([driver], run_is_active=False), [driver])
 
     def test_configured_wifi_nodes_are_config_derived(self):
         nodes = main.configured_wifi_nodes(
@@ -274,7 +297,7 @@ class MainMultiDeviceTest(unittest.TestCase):
 
         controller = ActiveController()
         main.LOAD_CONTROLLERS = {controller.uid: controller}
-        main.latest_readings_by_uid[controller.uid] = {
+        main.set_latest_reading(controller.uid, {
             "uid": controller.uid,
             "status": "ok",
             "data": {
@@ -283,7 +306,7 @@ class MainMultiDeviceTest(unittest.TestCase):
                 "power_w": 0.16,
                 "load_resistance_ohm": 1686.3,
             },
-        }
+        })
 
         response = main.get_loads()
         payload = json.loads(response.body)["loads"][0]
@@ -364,7 +387,7 @@ class MainMultiDeviceTest(unittest.TestCase):
         )
         self.assertEqual(main.RECORDER.samples, [])
 
-    def test_load_api_uses_none_instead_of_stale_values_after_poll_failure(self):
+    def test_failed_poll_preserves_previous_successful_reading_and_exposes_error(self):
         class Controller:
             uid = "yertai-et5406a-plus-001"
 
@@ -381,23 +404,86 @@ class MainMultiDeviceTest(unittest.TestCase):
 
         controller = Controller()
         main.LOAD_CONTROLLERS = {controller.uid: controller}
-        main.latest_readings_by_uid[controller.uid] = {
+        main.set_latest_reading(controller.uid, {
+            "uid": controller.uid,
+            "status": "ok",
+            "data": {
+                "voltage_v": 16.246,
+                "current_a": 0.010,
+                "power_w": 0.16,
+                "load_resistance_ohm": 1686.3,
+            },
+        })
+        main.set_latest_reading(controller.uid, {
             "uid": controller.uid,
             "status": "error",
-            "error": "serial timeout",
-        }
+            "extended": {"error": "serial timeout"},
+        })
 
         response = main.get_loads()
         payload = json.loads(response.body)["loads"][0]
         self.assertEqual(
             payload["live_reading"],
             {
-                "voltage_v": None,
-                "current_a": None,
-                "power_w": None,
-                "load_resistance_ohm": None,
+                "voltage_v": 16.246,
+                "current_a": 0.010,
+                "power_w": 0.16,
+                "load_resistance_ohm": 1686.3,
             },
         )
+        self.assertEqual(payload["panel_reading"], payload["live_reading"])
+        self.assertEqual(payload["poll_status"], "error")
+        self.assertEqual(payload["poll_error"], "serial timeout")
+
+    def test_successive_fixed_polls_replace_panel_reading_atomically(self):
+        class Controller:
+            uid = "load-001"
+
+            def state(self):
+                return {"uid": self.uid, "selected_mode": "fixed_resistance", "input_enabled": True}
+
+        controller = Controller()
+        main.LOAD_CONTROLLERS = {controller.uid: controller}
+        first = {"voltage_v": 16.2, "current_a": 0.010, "power_w": 0.16, "load_resistance_ohm": 1680.0}
+        second = {"voltage_v": 15.9, "current_a": 0.009, "power_w": 0.14, "load_resistance_ohm": 1766.7}
+        main.set_latest_reading(controller.uid, {"status": "ok", "data": first})
+        self.assertEqual(json.loads(main.get_loads().body)["loads"][0]["panel_reading"], first)
+        main.set_latest_reading(controller.uid, {"status": "ok", "data": second})
+        payload = json.loads(main.get_loads().body)["loads"][0]
+        self.assertEqual(payload["panel_reading"], second)
+        self.assertEqual(payload["panel_reading_source"], "et54_poll")
+
+    def test_sweep_mode_uses_latest_complete_mpp_atomically(self):
+        class Controller:
+            uid = "load-001"
+
+            def state(self):
+                return {
+                    "uid": self.uid,
+                    "selected_mode": "sweep",
+                    "sweep_state": "running",
+                    "last_successful_sweep": {
+                        "electrical_status": "complete",
+                        "vmpp_v": 15.8,
+                        "impp_a": 0.018,
+                        "pmpp_w": 0.2844,
+                        "rmpp_ohm": 877.8,
+                        "points": [{"voltage_v": 12.0, "current_a": 0.02}],
+                    },
+                }
+
+        controller = Controller()
+        main.LOAD_CONTROLLERS = {controller.uid: controller}
+        main.set_latest_reading(controller.uid, {
+            "status": "ok",
+            "data": {"voltage_v": 99, "current_a": 99, "power_w": 99, "load_resistance_ohm": 99},
+        })
+        payload = json.loads(main.get_loads().body)["loads"][0]
+        self.assertEqual(
+            payload["panel_reading"],
+            {"voltage_v": 15.8, "current_a": 0.018, "power_w": 0.2844, "load_resistance_ohm": 877.8},
+        )
+        self.assertEqual(payload["panel_reading_source"], "sweep_mpp")
 
     def test_running_sweep_is_skipped_without_blocking_other_generic_drivers(self):
         class RunningController:
@@ -420,6 +506,29 @@ class MainMultiDeviceTest(unittest.TestCase):
         thread.start()
         thread.join(timeout=1)
         self.assertFalse(thread.is_alive())
+        self.assertIn(("bb-solar-pnl-001", self.wifi_reading), main.RECORDER.samples)
+
+    def test_continuous_sweep_wait_does_not_allow_ordinary_et54_poll(self):
+        class SweepController:
+            def state(self):
+                return {"sweep_state": "completed", "sweep_run_active": True}
+
+            def poll_reading(self):
+                raise AssertionError("ordinary poll must remain suspended between continuous sweeps")
+
+        et54 = ET54Driver(uid="load-001", port="/dev/null")
+        main.DRIVERS = [et54, self.wifi]
+        main.LOAD_CONTROLLERS = {"load-001": SweepController()}
+        main.run_active = True
+        stop_event = threading.Event()
+        original_wifi_reading = self.wifi.get_reading
+
+        def wifi_reading_and_stop():
+            stop_event.set()
+            return original_wifi_reading()
+
+        self.wifi.get_reading = wifi_reading_and_stop
+        main.generic_polling_loop(stop_event, poll_interval_s=0.01)
         self.assertIn(("bb-solar-pnl-001", self.wifi_reading), main.RECORDER.samples)
 
     def test_unsafe_sweep_is_rejected_before_background_thread_starts(self):

@@ -789,7 +789,7 @@
 
       function panelReadingValues(data, load) {
         if (load) {
-          const measurement = load.live_reading || load.last_measurement || {};
+          const measurement = load.panel_reading || {};
           return {
             voltage_v: measurement.voltage_v ?? null,
             current_a: measurement.current_a ?? null,
@@ -959,7 +959,8 @@
         const status = loadStatusText(state);
         const fixedSelected = state.selected_mode === "fixed_resistance";
         const sweepSelected = state.selected_mode === "sweep";
-        const canConfigure = Boolean(state.safety_config_complete) && !state.active_mode && !state.sweep_run_active;
+        const transportUnconfirmed = state.safety_state === "disconnected_unconfirmed";
+        const canConfigure = Boolean(state.safety_config_complete) && !transportUnconfirmed && !state.active_mode && !state.sweep_run_active;
         const canStep = Boolean(state.safety_config_complete) && state.sweep_state !== "running";
         const canEnable = fixedSelected && canConfigure;
         const canApply = state.active_mode === "fixed_resistance" && state.input_enabled
@@ -971,11 +972,14 @@
         const canSelectRunMode = !state.sweep_run_active && state.sweep_state !== "running" && !state.active_mode;
         const canSweep = sweepSelected && canConfigure && Boolean(sweepConfig.valid);
         const canStop = Boolean(state.active_mode || state.input_enabled || state.sweep_state === "running" || state.sweep_run_active);
-        const canClearFault = state.safety_state === "safety_fault" || state.safety_state === "instrument_error";
-        const messageClass = state.safety_state === "safety_fault" || state.safety_state === "instrument_error" || !state.safety_config_complete
+        const canClearFault = state.safety_state === "safety_fault" || state.safety_state === "instrument_error" || transportUnconfirmed;
+        const messageClass = state.safety_state === "safety_fault" || state.safety_state === "instrument_error" || transportUnconfirmed || !state.safety_config_complete
           ? "load-message load-message-error"
           : "load-message";
         const lastSweep = state.last_sweep;
+        const inputStateLabel = state.safety_state === "disconnected_unconfirmed"
+          ? "Unknown (OFF unconfirmed)"
+          : (state.input_enabled ? "Enabled" : "OFF");
         const irradiance = lastSweep?.irradiance || {};
         const sweepValidationMessage = sweepSelected && !sweepConfig.valid
           ? `<div class="load-message load-message-error" data-sweep-validation>${escapeHtml(sweepConfig.error || "Sweep configuration is invalid")}</div>`
@@ -989,10 +993,14 @@
                 ${detailRow("Device", state.device || "ET5406A+")}
                 ${detailRow("UID", loadUid)}
                 ${detailRow("Status", state.safety_state)}
+                ${detailRow("Transport", state.transport_state || "disconnected")}
+                ${state.transport_message ? detailRow("Transport message", state.transport_message) : ""}
                 ${detailRow("Selected mode", state.selected_mode)}
                 ${detailRow("Active mode", state.active_mode || "None")}
-                ${detailRow("Input", state.input_enabled ? "Enabled" : "OFF")}
-                ${detailRow("Measured/effective R", state.input_enabled ? formatResistance((state.live_reading || state.last_measurement)?.load_resistance_ohm) : null)}
+                ${detailRow("Input", inputStateLabel)}
+                ${detailRow("Measured/effective R", state.input_enabled ? formatResistance(state.panel_reading?.load_resistance_ohm) : null)}
+                ${detailRow("Poll status", state.poll_status || "Waiting")}
+                ${state.poll_error ? detailRow("Poll error", state.poll_error) : ""}
                 ${detailRow("Sweep", state.sweep_state)}
               </div>
               <div class="load-mode-buttons">
