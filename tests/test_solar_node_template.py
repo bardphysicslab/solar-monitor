@@ -62,12 +62,13 @@ class SolarNodeTemplateTest(unittest.TestCase):
         self.assertNotIn("Sync to Server Time", TEMPLATE)
 
     def test_foldout_order_and_persistence_hooks_exist(self):
-        identity_index = TEMPLATE.index("<summary>Identity</summary>")
-        health_index = TEMPLATE.index("<summary>Health</summary>")
-        panels_index = TEMPLATE.index("<summary>Panel Readings</summary>")
+        rendered_card = TEMPLATE[TEMPLATE.index("function renderWifiNodes"):]
+        panels_index = rendered_card.index(">Panel Readings</h3>")
+        load_index = rendered_card.index("${loadFoldout")
+        hardware_index = rendered_card.index("${hardwareFoldout")
 
-        self.assertLess(identity_index, health_index)
-        self.assertLess(health_index, panels_index)
+        self.assertLess(panels_index, load_index)
+        self.assertLess(load_index, hardware_index)
         self.assertIn("const openSolarDetails = new Set();", TEMPLATE)
         self.assertIn("data-detail-key", TEMPLATE)
         self.assertIn('detail.addEventListener("toggle"', TEMPLATE)
@@ -78,7 +79,7 @@ class SolarNodeTemplateTest(unittest.TestCase):
         self.assertIn("const configuredLoad = configured.load || null;", TEMPLATE)
         self.assertIn("loadFoldout(uid, configuredLoad, load)", TEMPLATE)
         self.assertIn("No load is explicitly associated with this panel.", TEMPLATE)
-        self.assertIn("Electronic Load · ET5406A+", TEMPLATE)
+        self.assertIn("<span>Load Control</span>", TEMPLATE)
         self.assertNotIn("ET54 Nodes", TEMPLATE)
 
     def test_selected_mode_is_distinct_from_active_mode_and_activation_is_explicit(self):
@@ -93,32 +94,34 @@ class SolarNodeTemplateTest(unittest.TestCase):
         self.assertIn("Stop / Disable", TEMPLATE)
 
     def test_manual_cr_digit_stepper_uses_three_safe_server_validated_steps(self):
-        self.assertIn("formatResistanceKohm", TEMPLATE)
-        self.assertIn(".toFixed(2)", TEMPLATE)
+        self.assertIn("formatResistance(state.resistance_setpoint_ohm)", TEMPLATE)
+        self.assertIn("[10, 1, 0.1]", TEMPLATE)
         self.assertIn("[1000, 100, 10]", TEMPLATE)
         self.assertIn('data-load-action="step"', TEMPLATE)
         self.assertIn("/step`", TEMPLATE)
         self.assertNotIn("4500", TEMPLATE)
+        self.assertNotIn("Manual Ω", TEMPLATE)
+        self.assertNotIn("Set Manual", TEMPLATE)
+        self.assertIn('<div class="wifi-detail-label">Resistance</div>', TEMPLATE)
 
     def test_load_scientific_readings_and_safety_state_are_present(self):
         for text in (
             'detailRow("Voltage"',
             'detailRow("Current"',
             'detailRow("Power"',
-            'detailRow("Selected resistance"',
-            'detailRow("Measured/effective R"',
-            'detailRow("Status"',
+            'detailRow("Nominal RMPP"',
+            'detailRow("Measured RMPP"',
+            'detailRow("Resistance"',
+            'detailRow("Safety"',
         ):
             self.assertIn(text, TEMPLATE)
 
     def test_local_panel_omits_network_identity_while_remote_fields_remain_supported(self):
-        self.assertIn('const localSource = configured.source_location === "local";', TEMPLATE)
-        self.assertIn('${localSource ? "" : optionalDetailRow("IP address"', TEMPLATE)
-        self.assertIn('${localSource ? "" : optionalDetailRow("MAC address"', TEMPLATE)
-        self.assertIn('${localSource ? "" : optionalDetailRow("RSSI"', TEMPLATE)
-        self.assertIn('${detailRow("Type", "Solar Panel")}', TEMPLATE)
-        self.assertIn('${detailRow("UID", uid)}', TEMPLATE)
-        self.assertNotIn("<summary>Hardware</summary>", TEMPLATE)
+        self.assertNotIn("<summary>Identity</summary>", TEMPLATE)
+        self.assertNotIn("<summary>Health</summary>", TEMPLATE)
+        self.assertIn("<summary>Hardware</summary>", TEMPLATE)
+        self.assertIn('<h3 class="sweep-result-title">Panel</h3>', TEMPLATE)
+        self.assertIn('<h3 class="sweep-result-title">Electronic Load</h3>', TEMPLATE)
 
     def test_fixed_and_sweep_controls_are_mode_specific(self):
         self.assertIn("${fixedSelected ? `", TEMPLATE)
@@ -148,16 +151,26 @@ class SolarNodeTemplateTest(unittest.TestCase):
         self.assertNotIn('Math.max(y(mpp.power) - 8, 16)', TEMPLATE)
 
     def test_effective_resistance_requires_enabled_input(self):
-        self.assertIn(
-            "state.input_enabled ? formatResistance(state.panel_reading?.load_resistance_ohm) : null",
-            TEMPLATE,
-        )
+        self.assertIn("function formatOperatingResistance(valueOhm, inputEnabled)", TEMPLATE)
+        self.assertIn('inputEnabled ? formatResistance(valueOhm) : "Open"', TEMPLATE)
 
     def test_poll_failure_is_rendered_separately_from_panel_values(self):
-        self.assertIn('detailRow("Poll status", state.poll_status || "Waiting")', TEMPLATE)
-        self.assertIn('state.poll_error ? detailRow("Poll error", state.poll_error)', TEMPLATE)
-        self.assertIn('detailRow("Transport", state.transport_state || "disconnected")', TEMPLATE)
+        self.assertIn('detailRow("Poll status", pollStatus)', TEMPLATE)
+        self.assertIn('load?.poll_error ? detailRow("Poll error", load.poll_error)', TEMPLATE)
+        self.assertIn('detailRow("Transport", transport)', TEMPLATE)
         self.assertIn('"Unknown (OFF unconfirmed)"', TEMPLATE)
+
+    def test_primary_panel_ui_has_no_irradiance_or_driver_identity(self):
+        panel_markup = TEMPLATE[TEMPLATE.index('>Panel Readings</h3>'):]
+        panel_markup = panel_markup[:panel_markup.index('${loadFoldout')]
+        self.assertNotIn("Irradiance", panel_markup)
+        self.assertNotIn("Driver", panel_markup)
+        self.assertIn('detailRow("Nominal RMPP"', panel_markup)
+        self.assertIn('detailRow("Measured RMPP"', panel_markup)
+
+    def test_hardware_foldout_contains_panel_specs_and_load_diagnostics(self):
+        for label in ("Voc", "Vmp", "Imp", "Isc", "Pmp", "Power tolerance", "Device", "Driver", "Transport", "Port", "Poll status"):
+            self.assertIn(f'detailRow("{label}"', TEMPLATE)
 
     def test_resistance_format_uses_ohm_symbols(self):
         self.assertIn("function formatResistance(valueOhm)", TEMPLATE)

@@ -155,6 +155,57 @@ class MainMultiDeviceTest(unittest.TestCase):
         main.LOAD_CONTROLLERS = {driver.uid: Controller()}
         self.assertEqual(main.drivers_due_for_polling([driver], run_is_active=False), [driver])
 
+    def test_latched_load_fault_does_not_stop_open_circuit_acquisition(self):
+        stop_event = threading.Event()
+
+        class Driver:
+            uid = "load-001"
+
+        class FaultedController:
+            uid = "load-001"
+
+            def state(self):
+                return {
+                    "safety_state": "safety_fault",
+                    "input_enabled": False,
+                    "active_mode": None,
+                    "sweep_state": "idle",
+                    "sweep_run_active": False,
+                }
+
+            def poll_reading(self):
+                stop_event.set()
+                return {
+                    "uid": self.uid,
+                    "timestamp": "2026-09-02T12:00:00Z",
+                    "status": "ok",
+                    "data": {
+                        "voltage_v": 8.49,
+                        "current_a": 0.0,
+                        "power_w": 0.0,
+                        "load_resistance_ohm": None,
+                    },
+                    "extended": {},
+                    "raw": "open circuit",
+                }
+
+        driver = Driver()
+        controller = FaultedController()
+        main.DRIVERS = [driver]
+        main.LOAD_CONTROLLERS = {driver.uid: controller}
+
+        self.assertEqual(main.drivers_due_for_polling([driver], run_is_active=False), [driver])
+        main.generic_polling_loop(stop_event, poll_interval_s=0.01)
+
+        payload = json.loads(main.get_loads().body)["loads"][0]
+        self.assertEqual(payload["safety_state"], "safety_fault")
+        self.assertFalse(payload["input_enabled"])
+        self.assertEqual(payload["live_reading_state"], "live")
+        self.assertEqual(payload["panel_reading"]["voltage_v"], 8.49)
+        self.assertEqual(payload["panel_reading"]["current_a"], 0.0)
+        self.assertEqual(payload["panel_reading"]["power_w"], 0.0)
+        self.assertIsNone(payload["panel_reading"]["load_resistance_ohm"])
+
     def test_configured_wifi_nodes_are_config_derived(self):
         nodes = main.configured_wifi_nodes(
             {
@@ -173,6 +224,7 @@ class MainMultiDeviceTest(unittest.TestCase):
                     "driver": "wifi_node",
                     "host": "192.0.2.10",
                     "port": 1234,
+                    "panel_spec": {},
                     "source_location": "network",
                 }
             ],
@@ -438,6 +490,7 @@ class MainMultiDeviceTest(unittest.TestCase):
         self.assertEqual(payload["panel_reading"], payload["live_reading"])
         self.assertEqual(payload["poll_status"], "error")
         self.assertEqual(payload["poll_error"], "serial timeout")
+        self.assertEqual(payload["live_reading_state"], "stale")
 
     def test_successive_fixed_polls_replace_panel_reading_atomically(self):
         class Controller:

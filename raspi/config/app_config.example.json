@@ -24,9 +24,20 @@
           "voc_v": 8.51,
           "vmp_v": 7.28,
           "imp_a": 0.33,
-          "isc_a": null,
+          "isc_a": 0.36,
           "pmp_w": 2.37,
           "power_tolerance_pct": 10
+        },
+        "module_temperature": {
+          "channel": "module_temperature_c",
+          "sensor_uid": null,
+          "enabled": false
+        },
+        "source_profile": {
+          "type": "current_limited",
+          "max_voltage_v": 8.51,
+          "max_current_a": 0.36,
+          "max_power_w": 3.0636
         },
         "limits": {
           "absolute": {
@@ -95,7 +106,9 @@
           "interval_s": 10,
           "settle_s": 0.5,
           "max_load_resistance_ohm": 4500,
-          "point_count": 12
+          "point_count": 12,
+          "recovery_point_count": 12,
+          "irradiance_lookback_s": 60
         },
         "irradiance_quality": {
           "max_std_w_m2": "REPLACE_WITH_STUDY_THRESHOLD",

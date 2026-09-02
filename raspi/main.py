@@ -429,8 +429,7 @@ def drivers_due_for_polling(drivers: List[Any], run_is_active: bool) -> List[Any
             due.append(driver)
             continue
         state = controller.state()
-        transport_needs_recovery = state.get("transport_state") in {"disconnected", "reconnecting", "fault"}
-        if (state.get("input_enabled") or transport_needs_recovery) and state.get("sweep_state") != "running":
+        if state.get("sweep_state") != "running" and not state.get("sweep_run_active"):
             due.append(driver)
     return due
 
@@ -516,6 +515,9 @@ def configured_wifi_nodes(config: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "uid": entry.get("uid"),
                 "load_type": driver_config.get("load_type", "electronic_load"),
                 "driver": entry.get("driver"),
+                "device": "ET5406A+",
+                "port": driver_config.get("port"),
+                "baud": driver_config.get("baud", 9600),
             }
     for entry in config.get("drivers", []):
         if entry.get("driver") != "wifi_node":
@@ -527,6 +529,7 @@ def configured_wifi_nodes(config: Dict[str, Any]) -> List[Dict[str, Any]]:
             "driver": entry.get("driver"),
             "host": driver_config.get("host"),
             "port": driver_config.get("port", 1234),
+            "panel_spec": driver_config.get("panel_spec") or {},
         }
         load = loads_by_panel.get(entry.get("uid"))
         if load is not None:
@@ -723,6 +726,11 @@ def load_state_payload(controller: ElectronicLoadController) -> Dict[str, Any]:
     state["panel_reading"] = sweep_reading if use_sweep else live_reading
     state["panel_reading_source"] = "sweep_mpp" if use_sweep else ("et54_poll" if live_reading is not None else None)
     state["poll_status"] = latest_attempt.get("status") if latest_attempt is not None else None
+    state["live_reading_state"] = (
+        "waiting" if successful_reading is None
+        else "live" if latest_attempt is not None and latest_attempt.get("status") == "ok"
+        else "stale"
+    )
     poll_diagnostic = (
         (latest_attempt.get("extended") or {}).get("error")
         if latest_attempt is not None and latest_attempt.get("status") != "ok"

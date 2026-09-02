@@ -333,6 +333,7 @@ class CsvRecorderTest(unittest.TestCase):
                         "panel_voltage_2_v": 2,
                         "panel_voltage_3_v": None,
                         "panel_voltage_4_v": 4,
+                        "module_temperature_c": 31.25,
                     },
                     {"voltage_ok": 0, "rssi_dbm": -40},
                 ),
@@ -358,6 +359,7 @@ class CsvRecorderTest(unittest.TestCase):
             self.assertEqual(row["panel_voltage_2_v"], "2.0000")
             self.assertEqual(row["panel_voltage_3_v"], "9.0000")
             self.assertEqual(row["panel_voltage_4_v"], "4.0000")
+            self.assertEqual(row["module_temperature_c"], "31.250")
             self.assertEqual(row["voltage_ok"], "1")
 
     def test_error_readings_are_excluded_and_stopped_recorder_does_not_record(self):

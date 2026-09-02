@@ -58,6 +58,7 @@ SOLAR_HEADER = [
     "panel_voltage_2_v",
     "panel_voltage_3_v",
     "panel_voltage_4_v",
+    "module_temperature_c",
     "voltage_ok",
     "rssi_dbm",
 ]
@@ -350,6 +351,7 @@ class CsvAveragingRecorder:
         window.add_numeric("panel_voltage_2_v", data.get("panel_voltage_2_v"))
         window.add_numeric("panel_voltage_3_v", data.get("panel_voltage_3_v"))
         window.add_numeric("panel_voltage_4_v", data.get("panel_voltage_4_v"))
+        window.add_numeric("module_temperature_c", data.get("module_temperature_c"))
         window.add_numeric("rssi_dbm", extended.get("rssi_dbm"))
         window.add_binary("voltage_ok", extended.get("voltage_ok"))
 
@@ -433,6 +435,7 @@ class CsvAveragingRecorder:
                 "panel_voltage_2_v": self._format_mean(window, "panel_voltage_2_v", 4),
                 "panel_voltage_3_v": self._format_mean(window, "panel_voltage_3_v", 4),
                 "panel_voltage_4_v": self._format_mean(window, "panel_voltage_4_v", 4),
+                "module_temperature_c": self._format_mean(window, "module_temperature_c", 3),
                 "voltage_ok": self._format_binary(window, "voltage_ok"),
                 "rssi_dbm": self._format_mean(window, "rssi_dbm", 1),
             }

@@ -869,6 +869,10 @@
         return valueOhm >= 1000 ? `${(valueOhm / 1000).toFixed(2)} kΩ` : `${valueOhm.toFixed(1)} Ω`;
       }
 
+      function formatOperatingResistance(valueOhm, inputEnabled) {
+        return inputEnabled ? formatResistance(valueOhm) : "Open";
+      }
+
       function formatNumber(value, digits, suffix) {
         return typeof value === "number" && Number.isFinite(value) ? `${value.toFixed(digits)}${suffix}` : "—";
       }
@@ -924,11 +928,42 @@
         return "Disabled";
       }
 
+      function hardwareFoldout(uid, configured, configuredLoad, load) {
+        const spec = configured.panel_spec || {};
+        const transport = load?.transport_state || "disconnected";
+        const pollStatus = load?.poll_status || "Waiting";
+        return `
+          <details data-detail-key="${escapeHtml(detailKey(uid, "hardware"))}">
+            <summary>Hardware</summary>
+            <h3 class="sweep-result-title">Panel</h3>
+            <div class="wifi-detail-grid">
+              ${detailRow("UID", uid)}
+              ${detailRow("Voc", formatNumber(spec.voc_v, 2, " V"))}
+              ${detailRow("Vmp", formatNumber(spec.vmp_v, 2, " V"))}
+              ${detailRow("Imp", formatNumber(spec.imp_a, 3, " A"))}
+              ${detailRow("Isc", formatNumber(spec.isc_a, 3, " A"))}
+              ${detailRow("Pmp", formatNumber(spec.pmp_w, 2, " W"))}
+              ${detailRow("Power tolerance", typeof spec.power_tolerance_pct === "number" ? `±${spec.power_tolerance_pct} %` : null)}
+            </div>
+            <h3 class="sweep-result-title">Electronic Load</h3>
+            <div class="wifi-detail-grid">
+              ${detailRow("UID", configuredLoad?.uid)}
+              ${detailRow("Device", configuredLoad?.device || load?.device || "ET5406A+")}
+              ${detailRow("Driver", configuredLoad?.driver)}
+              ${detailRow("Transport", transport)}
+              ${detailRow("Port", configuredLoad?.port)}
+              ${detailRow("Poll status", pollStatus)}
+              ${load?.poll_error ? detailRow("Poll error", load.poll_error) : ""}
+              ${load?.transport_message ? detailRow("Transport detail", load.transport_message) : ""}
+            </div>
+          </details>`;
+      }
+
       function loadFoldout(uid, configuredLoad, load) {
         if (!configuredLoad) {
           return `
             <details data-detail-key="${escapeHtml(detailKey(uid, "load"))}">
-              <summary><span class="load-summary"><span>Load</span><span>Not assigned</span></span></summary>
+              <summary><span class="load-summary"><span>Load Control</span><span>Not assigned</span></span></summary>
               <div class="load-message">No load is explicitly associated with this panel.</div>
             </details>
           `;
@@ -956,7 +991,8 @@
         const sweepSelected = state.selected_mode === "sweep";
         const transportUnconfirmed = state.safety_state === "disconnected_unconfirmed";
         const canConfigure = Boolean(state.safety_config_complete) && !transportUnconfirmed && !state.active_mode && !state.sweep_run_active;
-        const canStep = Boolean(state.safety_config_complete) && state.sweep_state !== "running";
+        const canStep = Boolean(state.safety_config_complete) && Number.isFinite(state.resistance_setpoint_ohm) && state.sweep_state !== "running";
+        const resistanceSteps = state.resistance_setpoint_ohm < 1000 ? [10, 1, 0.1] : [1000, 100, 10];
         const canEnable = fixedSelected && canConfigure && Number.isFinite(state.resistance_setpoint_ohm);
         const canApply = state.active_mode === "fixed_resistance" && state.input_enabled
           && state.applied_resistance_ohm !== state.resistance_setpoint_ohm;
@@ -981,62 +1017,37 @@
           : "";
         return `
           <details data-detail-key="${escapeHtml(detailKey(uid, "load"))}">
-            <summary><span class="load-summary"><span>Load</span><span>Electronic Load · ET5406A+ · ${escapeHtml(status)}</span></span></summary>
+            <summary><span class="load-summary"><span>Load Control</span><span>${escapeHtml(status)}</span></span></summary>
             <div class="load-controls" data-load-uid="${escapeHtml(loadUid)}">
               <div class="wifi-detail-grid">
-                ${detailRow("Type", "Electronic Load")}
-                ${detailRow("Device", state.device || "ET5406A+")}
-                ${detailRow("UID", loadUid)}
-                ${detailRow("Status", state.safety_state)}
-                ${detailRow("Transport", state.transport_state || "disconnected")}
-                ${state.transport_message ? detailRow("Transport message", state.transport_message) : ""}
-                ${detailRow("Selected mode", state.selected_mode)}
-                ${detailRow("Active mode", state.active_mode || "None")}
                 ${detailRow("Input", inputStateLabel)}
-                ${detailRow("Measured/effective R", state.input_enabled ? formatResistance(state.panel_reading?.load_resistance_ohm) : null)}
-                ${detailRow("Poll status", state.poll_status || "Waiting")}
-                ${state.poll_error ? detailRow("Poll error", state.poll_error) : ""}
-                ${detailRow("Sweep", state.sweep_state)}
+                ${detailRow("Safety", state.safety_state)}
               </div>
               <div class="load-mode-buttons">
                 <button type="button" data-load-action="select-fixed" data-load-uid="${escapeHtml(loadUid)}" class="${fixedSelected ? "load-mode-selected" : ""}" ${canConfigure ? "" : "disabled"}>Fixed Resistance</button>
-                <button type="button" data-load-action="select-sweep" data-load-uid="${escapeHtml(loadUid)}" class="${sweepSelected ? "load-mode-selected" : ""}" ${canConfigure ? "" : "disabled"}>Sweep</button>
+                <button type="button" data-load-action="select-single-shot" data-load-uid="${escapeHtml(loadUid)}" class="${sweepSelected && singleShotSelected ? "load-mode-selected" : ""}" ${canConfigure ? "" : "disabled"}>Single Shot</button>
+                <button type="button" data-load-action="select-continuous" data-load-uid="${escapeHtml(loadUid)}" class="${sweepSelected && continuousSelected ? "load-mode-selected" : ""}" ${canConfigure ? "" : "disabled"}>Continuous</button>
               </div>
               ${fixedSelected ? `
-                <div class="wifi-detail-grid" data-fixed-resistance-controls>
-                  ${detailRow("Selected resistance", formatResistanceKohm(state.resistance_setpoint_ohm))}
-                  ${detailRow("Source", state.resistance_source === "measured_sweep" ? "Measured RMPP" : state.resistance_source === "datasheet" ? "Datasheet RMPP" : state.resistance_source === "manual" ? "Manual" : null)}
-                  ${detailRow("Nominal RMPP", formatResistance(state.nominal_rmpp_ohm))}
-                  ${detailRow("Measured RMPP", formatResistance(state.measured_rmpp_ohm))}
-                  ${detailRow("Applied resistance", state.input_enabled ? formatResistanceKohm(state.applied_resistance_ohm) : null)}
-                </div>
-                <div class="digit-stepper-wrap" aria-label="Fixed resistance digit stepper">
+                <div class="digit-stepper-wrap" data-fixed-resistance-controls aria-label="Fixed resistance digit stepper">
+                  <div class="wifi-detail-label">Resistance</div>
                   <div class="digit-stepper">
-                    ${[1000, 100, 10].map(step => `<button type="button" data-load-action="step" data-direction="1" data-step-ohm="${step}" data-load-uid="${escapeHtml(loadUid)}" ${canStep ? "" : "disabled"}>▲</button>`).join("")}
+                    ${resistanceSteps.map(step => `<button type="button" data-load-action="step" data-direction="1" data-step-ohm="${step}" data-load-uid="${escapeHtml(loadUid)}" ${canStep ? "" : "disabled"}>▲</button>`).join("")}
                   </div>
-                  <div class="digit-value">${escapeHtml(formatResistanceKohm(state.resistance_setpoint_ohm))}</div>
+                  <div class="digit-value">${escapeHtml(formatResistance(state.resistance_setpoint_ohm))}</div>
                   <div class="digit-stepper">
-                    ${[1000, 100, 10].map(step => `<button type="button" data-load-action="step" data-direction="-1" data-step-ohm="${step}" data-load-uid="${escapeHtml(loadUid)}" ${canStep ? "" : "disabled"}>▼</button>`).join("")}
+                    ${resistanceSteps.map(step => `<button type="button" data-load-action="step" data-direction="-1" data-step-ohm="${step}" data-load-uid="${escapeHtml(loadUid)}" ${canStep ? "" : "disabled"}>▼</button>`).join("")}
                   </div>
                 </div>
                 <div class="load-actions">
-                  <input type="number" min="0.05" step="0.01" data-manual-resistance data-load-uid="${escapeHtml(loadUid)}" placeholder="Manual Ω" />
-                  <button type="button" data-load-action="set-manual" data-load-uid="${escapeHtml(loadUid)}" ${canConfigure ? "" : "disabled"}>Set Manual</button>
                   <button type="button" data-load-action="enable-fixed" data-load-uid="${escapeHtml(loadUid)}" ${canEnable ? "" : "disabled"}>Enable Fixed Load</button>
                   <button type="button" data-load-action="apply-fixed" data-load-uid="${escapeHtml(loadUid)}" ${canApply ? "" : "disabled"}>Apply</button>
                   <button type="button" class="load-stop" data-load-action="disable" data-load-uid="${escapeHtml(loadUid)}" ${canStop ? "" : "disabled"}>Stop / Disable</button>
                   <button type="button" data-load-action="clear-fault" data-load-uid="${escapeHtml(loadUid)}" ${canClearFault ? "" : "disabled"}>Clear Latched Fault</button>
                 </div>
               ` : `
-                <div class="sweep-result" data-sweep-run-mode>
-                  <h3 class="sweep-result-title">Run mode</h3>
-                  <div class="load-mode-buttons">
-                    <button type="button" data-load-action="select-single-shot" data-load-uid="${escapeHtml(loadUid)}" class="${singleShotSelected ? "load-mode-selected" : ""}" ${canSelectRunMode ? "" : "disabled"}>Single Shot</button>
-                    <button type="button" data-load-action="select-continuous" data-load-uid="${escapeHtml(loadUid)}" class="${continuousSelected ? "load-mode-selected" : ""}" ${canSelectRunMode ? "" : "disabled"}>Continuous</button>
-                  </div>
-                </div>
                 <div class="wifi-detail-grid" data-sweep-summary>
-                  ${detailRow("Sweep range", sweepConfig.valid ? `${formatResistanceKohm(sweepConfig.max_resistance_ohm)} → ${formatResistanceKohm(sweepConfig.min_resistance_ohm)}` : null)}
+                  ${detailRow("Sweep range", sweepConfig.valid ? `${formatResistance(sweepConfig.max_resistance_ohm)} → ${formatResistance(sweepConfig.min_resistance_ohm)}` : null)}
                   ${detailRow("Points", sweepConfig.valid ? sweepConfig.point_count : null)}
                   ${detailRow("Settle time", formatNumber(sweepConfig.settle_s, 1, " s"))}
                   ${continuousSelected ? detailRow("Interval", formatNumber(sweepConfig.interval_s, 0, " s")) : ""}
@@ -1096,15 +1107,14 @@
           path = `/loads/${encodeURIComponent(uid)}/select`;
           payload.mode = action === "select-fixed" ? "fixed_resistance" : "sweep";
         } else if (action === "select-single-shot" || action === "select-continuous") {
+          await fetch(`/loads/${encodeURIComponent(uid)}/select`, {
+            method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ mode: "sweep" }),
+          });
           path = `/loads/${encodeURIComponent(uid)}/sweep/run-mode`;
           payload.run_mode = action === "select-continuous" ? "continuous" : "single_shot";
         } else if (action === "step") {
           path = `/loads/${encodeURIComponent(uid)}/step`;
           payload = { step_ohm: Number(element.dataset.stepOhm), direction: Number(element.dataset.direction) };
-        } else if (action === "set-manual") {
-          const input = wifiNodeListEl.querySelector(`[data-manual-resistance][data-load-uid="${CSS.escape(uid)}"]`);
-          path = `/loads/${encodeURIComponent(uid)}/select`;
-          payload = { mode: "fixed_resistance", resistance_ohm: Number(input?.value) };
         } else if (action === "enable-fixed") {
           path = `/loads/${encodeURIComponent(uid)}/fixed/enable`;
         } else if (action === "apply-fixed") {
@@ -1180,7 +1190,6 @@
           const data = reading?.data || {};
           const extended = reading?.extended || {};
           const state = nodeState(reading);
-          const statusClass = stateClass(state);
           const error = reading?.status === "error" ? extended.error : null;
           const firmware = extended.fw || extended.firmware;
           const rssi = extended.rssi_dbm;
@@ -1192,46 +1201,30 @@
           const load = configuredLoad ? loadStatesByUid.get(configuredLoad.uid) : null;
           const panelReadings = panelReadingValues(data, load);
           const localSource = configured.source_location === "local";
+          const panelState = load ? String(load.live_reading_state || "waiting").toUpperCase() : state;
+          const statusClass = stateClass(panelState);
           const errorMarkup = error ? `<div class="time-message">${escapeHtml(error)}</div>` : "";
 
           return `
             <section class="card chart-panel wifi-card">
               <div class="wifi-card-header">
-                <div class="wifi-uid">${escapeHtml(uid)}</div>
-                <div class="wifi-badge ${statusClass}">${escapeHtml(state)}</div>
+                <div class="wifi-uid">Solar Panel</div>
+                <div class="wifi-badge ${statusClass}">${escapeHtml(panelState)}</div>
               </div>
               <div class="wifi-details">
-                <details data-detail-key="${escapeHtml(detailKey(uid, "identity"))}">
-                  <summary>Identity</summary>
-                  <div class="wifi-detail-grid">
-                    ${detailRow("Type", "Solar Panel")}
-                    ${detailRow("UID", uid)}
-                    ${localSource ? "" : optionalDetailRow("Node model", nodeModel)}
-                    ${localSource ? "" : optionalDetailRow("Firmware", firmware)}
-                    ${localSource ? "" : optionalDetailRow("Protocol", extended.protocol)}
-                    ${localSource ? "" : optionalDetailRow("IP address", ipAddress || configured.host)}
-                    ${localSource ? "" : optionalDetailRow("MAC address", extended.mac)}
-                  </div>
-                </details>
-                <details data-detail-key="${escapeHtml(detailKey(uid, "health"))}">
-                  <summary>Health</summary>
-                  <div class="wifi-detail-grid">
-                    ${detailRow("Last updated", timestamp)}
-                    ${detailRow("Current state", state)}
-                    ${localSource ? "" : optionalDetailRow("Voltage OK", extended.voltage_ok === undefined ? null : formatVoltageOk(extended.voltage_ok))}
-                    ${localSource ? "" : optionalDetailRow("RSSI", rssi === undefined ? null : `${rssi} dBm`)}
-                    ${error ? detailRow("Error", error) : ""}
-                  </div>
-                </details>
-                <details data-detail-key="${escapeHtml(detailKey(uid, "panel-readings"))}">
-                  <summary>Panel Readings</summary>
+                <div data-panel-readings>
+                  <h3 class="sweep-result-title">Panel Readings</h3>
                   <div class="wifi-detail-grid">
                     ${detailRow("Voltage", formatNumber(panelReadings.voltage_v, 3, " V"))}
                     ${detailRow("Current", formatNumber(panelReadings.current_a, 3, " A"))}
                     ${detailRow("Power", formatNumber(panelReadings.power_w, 3, " W"))}
+                    ${detailRow("Resistance", formatOperatingResistance(panelReadings.load_resistance_ohm, load?.input_enabled))}
+                    ${detailRow("Nominal RMPP", formatResistance(load?.nominal_rmpp_ohm))}
+                    ${detailRow("Measured RMPP", formatResistance(load?.measured_rmpp_ohm))}
                   </div>
-                </details>
+                </div>
                 ${loadFoldout(uid, configuredLoad, load)}
+                ${hardwareFoldout(uid, configured, configuredLoad, load)}
               </div>
               ${errorMarkup}
             </section>

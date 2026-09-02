@@ -8,6 +8,7 @@ from raspi.load_control import (
     SafetyViolation,
     automatic_sweep_values,
     effective_safety_envelope,
+    logarithmic_resistance_values,
     nominal_rmpp_ohm,
     resistance_step,
 )
@@ -173,6 +174,7 @@ class LoadControlTest(unittest.TestCase):
         self.assertIsNone(nominal_rmpp_ohm({"vmp_v": 7.28, "imp_a": None}))
         self.assertIsNone(nominal_rmpp_ohm({"vmp_v": 0, "imp_a": 0.33}))
 
+
     def test_automatic_sweep_is_deterministic_descending_and_contains_nominal(self):
         first = automatic_sweep_values(1000, 100, 4500, point_count=10)
         second = automatic_sweep_values(1000, 100, 4500, point_count=10)
@@ -185,6 +187,91 @@ class LoadControlTest(unittest.TestCase):
     def test_automatic_sweep_rejects_range_that_cannot_bracket_nominal(self):
         with self.assertRaises(SafetyConfigurationError):
             automatic_sweep_values(22.1, 82.5, 4500)
+
+    def test_logarithmic_resistance_values_include_bounds(self):
+        values = logarithmic_resistance_values(500, 2000, 8)
+        self.assertEqual(len(values), 8)
+        self.assertEqual(values[0], 2000)
+        self.assertEqual(values[-1], 500)
+        self.assertEqual(values, sorted(values, reverse=True))
+
+    def test_adaptive_plan_uses_recent_then_nominal_and_requires_poa_geometry_for_irradiance(self):
+        config = load_config()
+        config["sweep"].pop("resistance_values_ohm")
+        panel = panel_config()
+        panel["config"]["panel_spec"] = {"vmp_v": 20, "imp_a": 0.02}
+        load = controller(config=config, panel=panel, irradiance=[100])
+        nominal = load.adaptive_sweep_plan()
+        self.assertEqual(nominal["center_source"], "datasheet_nominal")
+        self.assertEqual(nominal["center_resistance_ohm"], 1000)
+        self.assertEqual(len(nominal["first_pass_resistance_ohm"]), 8)
+        load.measured_rmpp_ohm = 1100
+        self.assertEqual(load.adaptive_sweep_plan()["center_source"], "recent_measured")
+        load.measured_rmpp_ohm = 99999
+        self.assertEqual(load.adaptive_sweep_plan()["center_source"], "datasheet_nominal")
+
+    def test_adaptive_plan_uses_irradiance_only_with_explicit_plane_of_array_geometry(self):
+        config = load_config()
+        config["sweep"].pop("resistance_values_ohm")
+        panel = panel_config()
+        panel["config"]["panel_spec"] = {
+            "vmp_v": 20,
+            "imp_a": 0.02,
+            "reference_irradiance_w_m2": 1000,
+        }
+        panel["config"]["irradiance_geometry"] = {"spn1_represents_plane_of_array": True}
+        load = controller(config=config, panel=panel, irradiance=[500, 500])
+        plan = load.adaptive_sweep_plan()
+        self.assertEqual(plan["center_source"], "irradiance_estimate")
+        self.assertEqual(plan["irradiance_used_w_m2"], 500)
+        self.assertEqual(plan["estimated_rmpp_ohm"], 2000)
+
+    def test_adaptive_sweep_uses_eight_first_pass_and_four_refinement_measurements(self):
+        config = load_config()
+        config["sweep"].pop("resistance_values_ohm")
+        panel = panel_config()
+        panel["config"]["panel_spec"] = {"vmp_v": 20, "imp_a": 0.02}
+        powers = [0.1, 0.2, 0.4, 0.8, 0.6, 0.3, 0.2, 0.1, 0.5, 0.7, 0.9, 0.8]
+        driver = FakeLoad([measurement(current=0, power=0)] + [measurement(power=power, resistance=900 + index) for index, power in enumerate(powers)])
+        result = controller(driver=driver, config=config, panel=panel).run_sweep()
+        self.assertEqual(len(result["points"]), 12)
+        self.assertEqual([point["phase"] for point in result["points"]].count("first_pass"), 8)
+        self.assertEqual([point["phase"] for point in result["points"]].count("refinement"), 4)
+        self.assertTrue(result["mpp_bracketed"])
+        self.assertFalse(result["recovery_used"])
+        self.assertEqual(result["center_source"], "datasheet_nominal")
+        self.assertEqual(result["pmpp_w"], 0.9)
+
+    def test_unbracketed_first_pass_uses_broad_bounded_recovery(self):
+        config = load_config()
+        config["sweep"].pop("resistance_values_ohm")
+        panel = panel_config()
+        panel["config"]["panel_spec"] = {"vmp_v": 20, "imp_a": 0.02}
+        first_powers = [0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1]
+        recovery_powers = [0.1, 0.2, 0.3, 0.4, 0.5, 0.9, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2]
+        all_powers = first_powers + recovery_powers
+        driver = FakeLoad([measurement(current=0, power=0)] + [measurement(power=power, resistance=1000 + index) for index, power in enumerate(all_powers)])
+        result = controller(driver=driver, config=config, panel=panel).run_sweep()
+        self.assertEqual(len(result["points"]), 20)
+        self.assertTrue(result["recovery_used"])
+        self.assertTrue(result["mpp_bracketed"])
+        self.assertEqual(len(result["recovery_resistance_ohm"]), 12)
+        self.assertEqual(result["electrical_status"], "complete")
+
+    def test_edge_maximum_after_recovery_is_not_reported_as_measured_mpp(self):
+        config = load_config()
+        config["sweep"].pop("resistance_values_ohm")
+        panel = panel_config()
+        panel["config"]["panel_spec"] = {"vmp_v": 20, "imp_a": 0.02}
+        powers = list(reversed(range(1, 9))) + list(reversed(range(1, 13)))
+        driver = FakeLoad([measurement(current=0, power=0)] + [measurement(power=float(power)) for power in powers])
+        load = controller(driver=driver, config=config, panel=panel)
+        result = load.run_sweep()
+        self.assertEqual(result["electrical_status"], "unbracketed")
+        self.assertFalse(result["mpp_bracketed"])
+        self.assertIsNone(result["pmpp_w"])
+        self.assertIsNone(result["rmpp_ohm"])
+        self.assertIsNone(load.state()["last_successful_sweep"])
 
     def test_safe_minimum_is_derived_without_100_ohm_fallback(self):
         panel_limits = {
@@ -199,6 +286,28 @@ class LoadControlTest(unittest.TestCase):
         self.assertEqual(envelope["min_load_resistance_ohm"], 20.0)
         self.assertNotEqual(envelope["min_load_resistance_ohm"], 100.0)
 
+    def test_current_limited_bench_source_allows_nominal_22_ohm(self):
+        limits = {
+            "absolute": {"max_voltage_v": 8.51, "max_current_a": 0.36, "max_power_w": 3.0636},
+            "operating": {"max_voltage_v": 8.51, "max_current_a": 0.36, "max_power_w": 3.0636},
+        }
+        load_limits = {
+            "absolute": {"max_voltage_v": 120, "max_current_a": 20, "max_power_w": 200, "min_load_resistance_ohm": 0.05, "max_load_resistance_ohm": 4500},
+            "operating": {"max_voltage_v": 8.51, "max_current_a": 0.36, "max_power_w": 3.0636, "max_load_resistance_ohm": 4500},
+        }
+        source = {"type": "current_limited", "max_voltage_v": 8.51, "max_current_a": 0.36, "max_power_w": 3.0636}
+        envelope = effective_safety_envelope(limits, load_limits, {"max_load_resistance_ohm": 4500}, source)
+        self.assertEqual(envelope["min_load_resistance_ohm"], 0.05)
+        self.assertEqual(envelope["max_load_resistance_ohm"], 4500)
+        self.assertGreater(22.06, envelope["min_load_resistance_ohm"])
+
+    def test_resistance_errors_distinguish_hardware_and_system_ranges(self):
+        load = controller()
+        with self.assertRaisesRegex(SafetyViolation, "outside the ET5406A\\+ hardware range"):
+            load._validate_resistance(0.01)
+        with self.assertRaisesRegex(SafetyViolation, "within the ET5406A\\+ hardware range.*system-safe range"):
+            load._validate_resistance(100)
+
     def test_startup_preselects_safe_datasheet_rmpp_without_energizing(self):
         panel = panel_config()
         panel["config"]["panel_spec"] = {"vmp_v": 20, "imp_a": 0.02}
@@ -209,6 +318,40 @@ class LoadControlTest(unittest.TestCase):
         self.assertEqual(state["resistance_source"], "datasheet")
         self.assertFalse(state["input_enabled"])
         self.assertNotIn("on", load.driver.commands)
+
+    def test_bench_profile_starts_at_nominal_22_06_ohm_with_input_off(self):
+        panel = panel_config()
+        panel["config"].update({
+            "panel_spec": {"vmp_v": 7.28, "imp_a": 0.330},
+            "source_profile": {
+                "type": "current_limited",
+                "max_voltage_v": 8.51,
+                "max_current_a": 0.36,
+                "max_power_w": 3.0636,
+            },
+            "limits": {
+                "absolute": {"max_voltage_v": 8.51, "max_current_a": 0.36, "max_power_w": 3.0636},
+                "operating": {"max_voltage_v": 8.51, "max_current_a": 0.36, "max_power_w": 3.0636},
+            },
+        })
+        config = load_config()
+        config["cr"].pop("default_resistance_ohm")
+        config["cr"].pop("min_load_resistance_ohm")
+        config["limits"]["operating"].update({
+            "max_voltage_v": 8.51,
+            "max_current_a": 0.36,
+            "max_power_w": 3.0636,
+        })
+        config["limits"]["operating"].pop("min_load_resistance_ohm")
+        driver = FakeLoad([measurement()])
+
+        state = controller(driver=driver, panel=panel, config=config).state()
+
+        self.assertAlmostEqual(state["nominal_rmpp_ohm"], 22.060606, places=5)
+        self.assertAlmostEqual(state["resistance_setpoint_ohm"], 22.060606, places=5)
+        self.assertEqual(state["resistance_source"], "datasheet")
+        self.assertFalse(state["input_enabled"])
+        self.assertNotIn("on", driver.commands)
 
     def test_effective_envelope_uses_most_restrictive_limits(self):
         envelope = effective_safety_envelope(
@@ -235,12 +378,16 @@ class LoadControlTest(unittest.TestCase):
                 with self.assertRaises(SafetyConfigurationError):
                     missing_load.safety_envelope(mode)
 
-    def test_digit_steps_and_clamping(self):
+    def test_digit_steps_and_bounds_rejection(self):
+        self.assertEqual(resistance_step(22.06, 0.1, 1, 0.05, 4500), 22.16)
+        self.assertEqual(resistance_step(22.06, 1, -1, 0.05, 4500), 21.06)
         self.assertEqual(resistance_step(1370, 10, 1, 800, 4500), 1380)
         self.assertEqual(resistance_step(1370, 100, 1, 800, 4500), 1470)
         self.assertEqual(resistance_step(1370, 1000, 1, 800, 4500), 2370)
-        self.assertEqual(resistance_step(4500, 10, 1, 800, 4500), 4500)
-        self.assertEqual(resistance_step(800, 10, -1, 800, 4500), 800)
+        with self.assertRaises(ValueError):
+            resistance_step(4500, 10, 1, 800, 4500)
+        with self.assertRaises(ValueError):
+            resistance_step(800, 10, -1, 800, 4500)
 
     def test_selection_and_stepping_do_not_send_instrument_commands(self):
         driver = FakeLoad()
@@ -324,6 +471,7 @@ class LoadControlTest(unittest.TestCase):
                     load.enable_fixed()
                 self.assertIn("off", driver.commands)
                 self.assertEqual(load.state()["safety_state"], "safety_fault")
+
 
     def test_transport_exception_attempts_off_and_latches_instrument_error(self):
         driver = FakeLoad()
@@ -416,9 +564,9 @@ class LoadControlTest(unittest.TestCase):
     def test_sweep_high_to_low_preserves_points_and_selects_computed_mpp(self):
         driver = FakeLoad([
             measurement(voltage=20, current=0, power=0, resistance=1200),
-            measurement(voltage=20, current=0.01, power=0.1, resistance=1200),
-            measurement(voltage=18, current=0.03, power=0.2, resistance=1000),
-            measurement(voltage=15, current=0.02, power=0.5, resistance=800),
+            measurement(voltage=20, current=0.01, power=0.20, resistance=1200),
+            measurement(voltage=18, current=0.03, power=0.54, resistance=1000),
+            measurement(voltage=15, current=0.02, power=0.30, resistance=800),
         ])
         saved = []
         load = controller(driver=driver, sink=saved.append)
@@ -515,9 +663,9 @@ class LoadControlTest(unittest.TestCase):
     def test_successful_single_shot_resumes_fixed_at_measured_rmpp(self):
         driver = FakeLoad([
             measurement(current=0, power=0),
-            measurement(voltage=16, current=0.01, resistance=1200),
-            measurement(voltage=15, current=0.02, resistance=1000),
-            measurement(voltage=14, current=0.01, resistance=800),
+            measurement(voltage=16, current=0.01, power=0.16, resistance=1200),
+            measurement(voltage=15, current=0.02, power=0.30, resistance=1000),
+            measurement(voltage=14, current=0.01, power=0.14, resistance=800),
             measurement(voltage=16, current=0, power=0, resistance=1000),
             measurement(voltage=15, current=0.02, power=0.3, resistance=1000),
         ])
@@ -554,13 +702,13 @@ class LoadControlTest(unittest.TestCase):
         clock = FakeClock()
         driver = FakeLoad([
             measurement(current=0, power=0),
-            measurement(voltage=16, current=0.01, resistance=1200),
-            measurement(voltage=15, current=0.02, resistance=1000),
-            measurement(voltage=14, current=0.01, resistance=800),
+            measurement(voltage=16, current=0.01, power=0.16, resistance=1200),
+            measurement(voltage=15, current=0.02, power=0.30, resistance=1000),
+            measurement(voltage=14, current=0.01, power=0.14, resistance=800),
             measurement(current=0, power=0),
-            measurement(voltage=15, current=0.01, resistance=1200),
-            measurement(voltage=14, current=0.02, resistance=1000),
-            measurement(voltage=13, current=0.03, resistance=800),
+            measurement(voltage=15, current=0.01, power=0.15, resistance=1200),
+            measurement(voltage=14, current=0.02, power=0.28, resistance=1000),
+            measurement(voltage=13, current=0.03, power=0.39, resistance=800),
         ])
         saved = []
         load = controller(driver=driver, monotonic_fn=clock.monotonic, wait_fn=clock.wait)

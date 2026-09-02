@@ -62,11 +62,14 @@ def numeric(value: Any) -> Optional[float]:
 def resistance_step(value_ohm: float, step_ohm: float, direction: int, minimum: float, maximum: float) -> float:
     value = float(value_ohm)
     step = float(step_ohm)
-    if step not in {10.0, 100.0, 1000.0}:
-        raise ValueError("Manual resistance steps must be 10, 100, or 1000 ohm")
+    if step not in {0.1, 1.0, 10.0, 100.0, 1000.0}:
+        raise ValueError("Manual resistance step is unsupported")
     if direction not in {-1, 1}:
         raise ValueError("Direction must be -1 or 1")
-    return min(maximum, max(minimum, round(value + direction * step, 6)))
+    result = round(value + direction * step, 6)
+    if result < minimum or result > maximum:
+        raise ValueError(f"Resistance step would leave the system-safe range {minimum:g}-{maximum:g} ohm")
+    return result
 
 
 def nominal_rmpp_ohm(panel_spec: Dict[str, Any]) -> Optional[float]:
@@ -94,6 +97,15 @@ def automatic_sweep_values(nominal_ohm: float, minimum_ohm: float, maximum_ohm: 
     return sorted({round(value, 6) for value in generated}, reverse=True)
 
 
+def logarithmic_resistance_values(minimum_ohm: float, maximum_ohm: float, count: int) -> List[float]:
+    minimum = numeric(minimum_ohm)
+    maximum = numeric(maximum_ohm)
+    if minimum is None or maximum is None or minimum <= 0 or maximum <= minimum or count < 2:
+        raise SafetyConfigurationError("logarithmic sweep requires positive ordered bounds and at least two points")
+    ratio = (maximum / minimum) ** (1.0 / (count - 1))
+    return [round(maximum / (ratio ** index), 6) for index in range(count)]
+
+
 def _limit(profile: Dict[str, Any], name: str) -> Optional[float]:
     return numeric((profile or {}).get(name))
 
@@ -109,7 +121,12 @@ def _validate_profile(owner: str, limits: Dict[str, Any]) -> List[str]:
     return errors
 
 
-def effective_safety_envelope(panel_limits: Dict[str, Any], load_limits: Dict[str, Any], mode_config: Dict[str, Any]) -> Dict[str, float]:
+def effective_safety_envelope(
+    panel_limits: Dict[str, Any],
+    load_limits: Dict[str, Any],
+    mode_config: Dict[str, Any],
+    source_profile: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     errors = _validate_profile("panel", panel_limits) + _validate_profile("load", load_limits)
     load_absolute = load_limits.get("absolute") or {}
     load_operating = load_limits.get("operating") or {}
@@ -149,7 +166,20 @@ def effective_safety_envelope(panel_limits: Dict[str, Any], load_limits: Dict[st
         _limit(load_operating, "min_load_resistance_ohm"),
         numeric(mode_config.get("min_load_resistance_ohm")),
     ]
-    if all(math.isfinite(value) and value > 0 for value in (max_voltage, max_current, max_power)):
+    source_kind = str((source_profile or {}).get("type") or "stiff_voltage").lower()
+    if source_kind == "current_limited":
+        source_voltage = numeric((source_profile or {}).get("max_voltage_v"))
+        source_current = numeric((source_profile or {}).get("max_current_a"))
+        source_power = numeric((source_profile or {}).get("max_power_w"))
+        if any(value is None or value <= 0 for value in (source_voltage, source_current, source_power)):
+            errors.append("current-limited source max_voltage_v, max_current_a, and max_power_w are required")
+        else:
+            load_voltage_limit = min(_limit(load_absolute, "max_voltage_v") or math.inf, _limit(load_operating, "max_voltage_v") or math.inf)
+            load_current_limit = min(_limit(load_absolute, "max_current_a") or math.inf, _limit(load_operating, "max_current_a") or math.inf)
+            load_power_limit = min(_limit(load_absolute, "max_power_w") or math.inf, _limit(load_operating, "max_power_w") or math.inf)
+            if source_voltage > load_voltage_limit or source_current > load_current_limit or source_power > load_power_limit:
+                errors.append("current-limited source capability exceeds configured ET54 load operating limits")
+    elif all(math.isfinite(value) and value > 0 for value in (max_voltage, max_current, max_power)):
         minimum_candidates.extend((max_voltage / max_current, max_voltage * max_voltage / max_power))
     minimum_candidates = [value for value in minimum_candidates if value is not None and value > 0]
     if not minimum_candidates:
@@ -169,6 +199,7 @@ def effective_safety_envelope(panel_limits: Dict[str, Any], load_limits: Dict[st
         "max_power_w": max_power,
         "min_load_resistance_ohm": minimum,
         "max_load_resistance_ohm": maximum,
+        "source_model": source_kind,
     }
 
 
@@ -249,7 +280,8 @@ class ElectronicLoadController:
         panel_limits = (self.panel_config.get("config") or {}).get("limits") or {}
         mode_name = mode or self.selected_mode
         mode_config = self.config.get("cr" if mode_name == "fixed_resistance" else "sweep") or {}
-        return effective_safety_envelope(panel_limits, load_limits, mode_config)
+        source_profile = (self.panel_config.get("config") or {}).get("source_profile") if self.panel_config else None
+        return effective_safety_envelope(panel_limits, load_limits, mode_config, source_profile)
 
     def state(self) -> Dict[str, Any]:
         with self._lock:
@@ -374,6 +406,7 @@ class ElectronicLoadController:
                 envelope["max_load_resistance_ohm"],
             )
             self.selected_resistance_ohm = selected
+            self.resistance_source = "manual"
             return self.state()
 
     def enable_fixed(self) -> Dict[str, Any]:
@@ -529,13 +562,7 @@ class ElectronicLoadController:
         except (TypeError, ValueError) as exc:
             raise SafetyConfigurationError("sweep resistance values must be numeric") from exc
         if not values:
-            envelope = self.safety_envelope("sweep")
-            values = automatic_sweep_values(
-                self.nominal_rmpp_ohm,
-                envelope["min_load_resistance_ohm"],
-                envelope["max_load_resistance_ohm"],
-                int(sweep_config.get("point_count", 12)),
-            )
+            values = self.adaptive_sweep_plan()["first_pass_resistance_ohm"]
         if values != sorted(values, reverse=True):
             raise SafetyConfigurationError("sweep resistance values must be high-to-low")
         for value in values:
@@ -544,6 +571,73 @@ class ElectronicLoadController:
         if settle_s is None or settle_s < 0:
             raise SafetyConfigurationError("sweep.settle_s must be a non-negative number")
         return envelope, values, settle_s
+
+    def adaptive_sweep_plan(self, now: Optional[datetime] = None) -> Dict[str, Any]:
+        envelope = self.safety_envelope("sweep")
+        sweep_config = self.config.get("sweep") or {}
+        configured_values = sweep_config.get("resistance_values_ohm") or []
+        if configured_values:
+            values = [float(value) for value in configured_values]
+            for value in values:
+                self._validate_resistance(value, mode="sweep", envelope=envelope)
+            return {
+                "strategy": "configured",
+                "center_resistance_ohm": values[len(values) // 2],
+                "center_source": "configured",
+                "estimated_rmpp_ohm": None,
+                "irradiance_used_w_m2": None,
+                "initial_bounds_ohm": {"min": min(values), "max": max(values)},
+                "first_pass_resistance_ohm": values,
+            }
+        center = numeric(self.measured_rmpp_ohm)
+        center_source = "recent_measured" if center is not None else None
+        if center is not None:
+            try:
+                self._validate_resistance(center, mode="sweep", envelope=envelope)
+            except LoadControlError:
+                center = None
+                center_source = None
+        irradiance_used = None
+
+        geometry = ((self.panel_config or {}).get("config") or {}).get("irradiance_geometry") or {}
+        if center is None and geometry.get("spn1_represents_plane_of_array") is True:
+            now = now or datetime.now(timezone.utc)
+            lookback_s = numeric(sweep_config.get("irradiance_lookback_s")) or 60.0
+            start = (now - timedelta(seconds=lookback_s)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            end = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+            irradiance_samples = [numeric(value) for value in self.irradiance_provider(start, end)]
+            irradiance_samples = [value for value in irradiance_samples if value is not None and value > 0]
+            vmp = numeric(self.panel_spec.get("vmp_v"))
+            imp = numeric(self.panel_spec.get("imp_a"))
+            reference = numeric(self.panel_spec.get("reference_irradiance_w_m2")) or 1000.0
+            if irradiance_samples and vmp and imp and reference > 0:
+                irradiance_used = statistics.fmean(irradiance_samples)
+                center = vmp / (imp * (irradiance_used / reference))
+                center_source = "irradiance_estimate"
+
+        if center is None:
+            center = self.nominal_rmpp_ohm
+            center_source = "datasheet_nominal"
+        if center is None:
+            raise SafetyConfigurationError("adaptive sweep requires a measured, irradiance-estimated, or nominal RMPP center")
+        self._validate_resistance(center, mode="sweep", envelope=envelope)
+
+        lower = max(envelope["min_load_resistance_ohm"], center * 0.5)
+        upper = min(envelope["max_load_resistance_ohm"], center * 2.0)
+        if not lower < center < upper:
+            raise SafetyConfigurationError("adaptive sweep center cannot be bracketed inside the safe resistance range")
+        first_pass = logarithmic_resistance_values(lower, upper, 8)
+        for value in first_pass:
+            self._validate_resistance(value, mode="sweep", envelope=envelope)
+        return {
+            "strategy": "adaptive",
+            "center_resistance_ohm": center,
+            "center_source": center_source,
+            "estimated_rmpp_ohm": center if center_source == "irradiance_estimate" else None,
+            "irradiance_used_w_m2": irradiance_used,
+            "initial_bounds_ohm": {"min": lower, "max": upper},
+            "first_pass_resistance_ohm": first_pass,
+        }
 
     def run_sweep(
         self,
@@ -555,7 +649,9 @@ class ElectronicLoadController:
         with self._lock:
             if self.active_mode is not None or self.safety_state in {"safety_fault", "instrument_error", "disconnected_unconfirmed"}:
                 raise LoadControlError("Load must be disabled and fault-cleared before sweep")
-            envelope, values, settle_s = self.validate_sweep_configuration()
+            envelope, _legacy_values, settle_s = self.validate_sweep_configuration()
+            plan = self.adaptive_sweep_plan()
+            first_pass_values = plan["first_pass_resistance_ohm"]
             self.selected_mode = "sweep"
             self.active_mode = "sweep"
             self.input_enabled = False
@@ -571,6 +667,10 @@ class ElectronicLoadController:
         scheduled_monotonic = started_monotonic if scheduled_monotonic is None else scheduled_monotonic
         scheduled_start_at = scheduled_start_at or actual_started_at
         points: List[Dict[str, Any]] = []
+        refinement_values: List[float] = []
+        recovery_values: List[float] = []
+        mpp_bracketed = False
+        recovery_used = False
         electrical_status = "complete"
         reason = None
         off_confirmed = False
@@ -581,31 +681,57 @@ class ElectronicLoadController:
                 self.driver.get_mode()
                 self.driver.input_state()
                 self.driver.set_mode_cr()
-                self.driver.set_resistance(values[0])
+                self.driver.set_resistance(first_pass_values[0])
                 open_measurement = self.driver.measure_all()
                 self._validate_measurement(open_measurement, envelope)
                 self.driver.input_on()
                 with self._lock:
                     self.input_enabled = True
-                for value in values:
-                    if self._stop_requested.is_set():
-                        raise OperationStopped("Sweep stopped by user")
-                    if previous is not None:
-                        self._validate_measurement(previous, envelope)
-                    self._validate_resistance(value, envelope=envelope)
-                    self.driver.set_resistance(value)
-                    if settle_s:
-                        if self.wait_fn(settle_s):
+
+                def measure_values(values: List[float], phase: str) -> None:
+                    nonlocal previous
+                    for value in values:
+                        if self._stop_requested.is_set():
                             raise OperationStopped("Sweep stopped by user")
-                    measurement = self.driver.measure_all()
-                    point = {
-                        "timestamp": utc_timestamp(),
-                        "resistance_setpoint_ohm": value,
-                        **measurement,
-                    }
-                    points.append(point)
-                    self._validate_measurement(measurement, envelope)
-                    previous = measurement
+                        if previous is not None:
+                            self._validate_measurement(previous, envelope)
+                        self._validate_resistance(value, envelope=envelope)
+                        self.driver.set_resistance(value)
+                        if settle_s and self.wait_fn(settle_s):
+                            raise OperationStopped("Sweep stopped by user")
+                        measurement = self.driver.measure_all()
+                        points.append({
+                            "timestamp": utc_timestamp(),
+                            "phase": phase,
+                            "resistance_setpoint_ohm": value,
+                            **measurement,
+                        })
+                        self._validate_measurement(measurement, envelope)
+                        previous = measurement
+
+                measure_values(first_pass_values, "first_pass")
+                first_pass_points = list(points)
+                best_index = max(range(len(first_pass_points)), key=lambda index: first_pass_points[index]["power_w"])
+                if plan["strategy"] == "configured":
+                    mpp_bracketed = True
+                elif 0 < best_index < len(first_pass_points) - 1:
+                    bracket_high = first_pass_points[best_index - 1]["resistance_setpoint_ohm"]
+                    bracket_low = first_pass_points[best_index + 1]["resistance_setpoint_ohm"]
+                    refinement_values = logarithmic_resistance_values(bracket_low, bracket_high, 6)[1:-1]
+                    measure_values(refinement_values, "refinement")
+                    mpp_bracketed = True
+                else:
+                    recovery_used = True
+                    recovery_values = automatic_sweep_values(
+                        plan["center_resistance_ohm"],
+                        envelope["min_load_resistance_ohm"],
+                        envelope["max_load_resistance_ohm"],
+                        int((self.config.get("sweep") or {}).get("recovery_point_count", 12)),
+                    )
+                    measure_values(recovery_values, "recovery")
+                    recovery_points = [point for point in points if point["phase"] == "recovery"]
+                    recovery_best = max(range(len(recovery_points)), key=lambda index: recovery_points[index]["power_w"])
+                    mpp_bracketed = 0 < recovery_best < len(recovery_points) - 1
         except SafetyViolation as exc:
             electrical_status = "safety_abort"
             reason = str(exc)
@@ -627,9 +753,13 @@ class ElectronicLoadController:
         completed_monotonic = self.monotonic_fn()
         duration_s = max(0.0, completed_monotonic - started_monotonic)
         irradiance = self._irradiance_statistics(actual_started_at, completed_at)
-        if electrical_status == "complete" and len(points) != len(values):
+        expected_points = len(first_pass_values) + len(refinement_values) + len(recovery_values)
+        if electrical_status == "complete" and len(points) != expected_points:
             electrical_status = "incomplete"
-            reason = f"Sweep completed {len(points)}/{len(values)} electrical points"
+            reason = f"Sweep completed {len(points)}/{expected_points} electrical points"
+        if electrical_status == "complete" and not mpp_bracketed:
+            electrical_status = "unbracketed"
+            reason = "Measured maximum remained at a resistance-search boundary"
         if irradiance["count"] == 0:
             irradiance_status = "unavailable"
         elif self._irradiance_unstable(irradiance):
@@ -651,7 +781,7 @@ class ElectronicLoadController:
         else:
             timing_status = "on_time"
 
-        mpp_point = max(points, key=lambda point: point["voltage_v"] * point["current_a"]) if points else None
+        mpp_point = max(points, key=lambda point: point["power_w"]) if points and mpp_bracketed else None
         result = {
             "sweep_id": sweep_id,
             "panel_uid": self.panel_uid,
@@ -669,9 +799,20 @@ class ElectronicLoadController:
             "quality": quality,
             "reason": reason,
             "points": points,
+            "sweep_center_resistance_ohm": plan["center_resistance_ohm"],
+            "center_source": plan["center_source"],
+            "estimated_rmpp_ohm": plan["estimated_rmpp_ohm"],
+            "initial_search_bounds_ohm": plan["initial_bounds_ohm"],
+            "first_pass_resistance_ohm": first_pass_values,
+            "refinement_resistance_ohm": refinement_values,
+            "mpp_bracketed": mpp_bracketed,
+            "recovery_used": recovery_used,
+            "recovery_resistance_ohm": recovery_values,
+            "irradiance_used_w_m2": plan["irradiance_used_w_m2"],
+            "module_temperature_c": None,
             "vmpp_v": mpp_point.get("voltage_v") if mpp_point else None,
             "impp_a": mpp_point.get("current_a") if mpp_point else None,
-            "pmpp_w": (mpp_point["voltage_v"] * mpp_point["current_a"]) if mpp_point else None,
+            "pmpp_w": mpp_point.get("power_w") if mpp_point else None,
             "rmpp_ohm": mpp_point.get("load_resistance_ohm") if mpp_point else None,
             "irradiance": irradiance,
         }
@@ -791,11 +932,21 @@ class ElectronicLoadController:
         return results
 
     def _validate_resistance(self, value: float, mode: Optional[str] = None, envelope: Optional[Dict[str, float]] = None) -> None:
-        limits = envelope or self.safety_envelope(mode or self.selected_mode)
-        if value < limits["min_load_resistance_ohm"] or value > limits["max_load_resistance_ohm"]:
+        numeric_value = numeric(value)
+        if numeric_value is None:
+            raise SafetyViolation("Resistance must be a finite number")
+        if numeric_value < ET54_HARDWARE_MIN_RESISTANCE_OHM or numeric_value > ET54_HARDWARE_MAX_RESISTANCE_OHM:
             raise SafetyViolation(
-                f"Resistance {value:g} ohm is outside safe range "
-                f"{limits['min_load_resistance_ohm']:.2f}-{limits['max_load_resistance_ohm']:.2f} ohm"
+                f"{numeric_value:g} ohm is outside the ET5406A+ hardware range "
+                f"({ET54_HARDWARE_MIN_RESISTANCE_OHM:g}-{ET54_HARDWARE_MAX_RESISTANCE_OHM:g} ohm)"
+            )
+        limits = envelope or self.safety_envelope(mode or self.selected_mode)
+        if numeric_value < limits["min_load_resistance_ohm"] or numeric_value > limits["max_load_resistance_ohm"]:
+            raise SafetyViolation(
+                f"{numeric_value:g} ohm is within the ET5406A+ hardware range "
+                f"({ET54_HARDWARE_MIN_RESISTANCE_OHM:g}-{ET54_HARDWARE_MAX_RESISTANCE_OHM:g} ohm) but outside the "
+                f"currently configured system-safe range: {limits['min_load_resistance_ohm']:.3g}-"
+                f"{limits['max_load_resistance_ohm']:.3g} ohm"
             )
 
     def _validate_measurement(self, measurement: Dict[str, Any], envelope: Dict[str, float]) -> None:
@@ -807,8 +958,9 @@ class ElectronicLoadController:
             value = numeric(measurement.get(field))
             if value is None:
                 raise SafetyViolation(f"Missing or invalid runtime measurement: {field}")
-            if value >= envelope[limit_name]:
-                raise SafetyViolation(f"{field} reached safety limit: {value:g} >= {envelope[limit_name]:g}")
+            limit = envelope[limit_name]
+            if value >= limit:
+                raise SafetyViolation(f"{field} reached safety limit: {value:g} >= {limit:g}")
 
     def _safe_off(self) -> None:
         try:
