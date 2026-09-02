@@ -30,7 +30,7 @@ class SolarNodeTemplateTest(unittest.TestCase):
         self.assertIn("nodesByUid.set(node.uid, existing);", TEMPLATE)
 
     def test_state_badges_are_supported(self):
-        for state in ("STOPPED", "WAITING", "LIVE", "OFFLINE", "CATCHUP"):
+        for state in ("WAITING", "LIVE", "OFFLINE", "CATCHUP"):
             self.assertIn(state, TEMPLATE)
 
     def test_responsive_panel_grid(self):
@@ -42,10 +42,8 @@ class SolarNodeTemplateTest(unittest.TestCase):
         self.assertIn("@media (max-width: 600px)", TEMPLATE)
         self.assertIn("grid-template-columns: 1fr;", TEMPLATE)
 
-    def test_spn1_control_and_chart_ids_remain(self):
+    def test_spn1_continuous_acquisition_and_chart_ids_remain(self):
         for element_id in (
-            "start-button",
-            "stop-button",
             "total-chart",
             "diffuse-chart",
             "sun-chart",
@@ -54,6 +52,9 @@ class SolarNodeTemplateTest(unittest.TestCase):
             "sun-value",
         ):
             self.assertIn(f'id="{element_id}"', TEMPLATE)
+        self.assertNotIn('id="start-button"', TEMPLATE)
+        self.assertNotIn('id="stop-button"', TEMPLATE)
+        self.assertIn("Continuous acquisition", TEMPLATE)
 
     def test_manual_spn1_time_card_is_removed(self):
         self.assertNotIn("SPN1 Time", TEMPLATE)

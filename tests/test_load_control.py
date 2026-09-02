@@ -6,7 +6,9 @@ from raspi.load_control import (
     LoadControlError,
     SafetyConfigurationError,
     SafetyViolation,
+    automatic_sweep_values,
     effective_safety_envelope,
+    nominal_rmpp_ohm,
     resistance_step,
 )
 
@@ -166,6 +168,48 @@ class FakeClock:
 
 
 class LoadControlTest(unittest.TestCase):
+    def test_nominal_rmpp_requires_valid_vmp_and_imp(self):
+        self.assertAlmostEqual(nominal_rmpp_ohm({"vmp_v": 7.28, "imp_a": 0.330}), 22.060606, places=5)
+        self.assertIsNone(nominal_rmpp_ohm({"vmp_v": 7.28, "imp_a": None}))
+        self.assertIsNone(nominal_rmpp_ohm({"vmp_v": 0, "imp_a": 0.33}))
+
+    def test_automatic_sweep_is_deterministic_descending_and_contains_nominal(self):
+        first = automatic_sweep_values(1000, 100, 4500, point_count=10)
+        second = automatic_sweep_values(1000, 100, 4500, point_count=10)
+        self.assertEqual(first, second)
+        self.assertEqual(first, sorted(first, reverse=True))
+        self.assertIn(1000, first)
+        self.assertEqual(first[0], 4500)
+        self.assertEqual(first[-1], 100)
+
+    def test_automatic_sweep_rejects_range_that_cannot_bracket_nominal(self):
+        with self.assertRaises(SafetyConfigurationError):
+            automatic_sweep_values(22.1, 82.5, 4500)
+
+    def test_safe_minimum_is_derived_without_100_ohm_fallback(self):
+        panel_limits = {
+            "absolute": {"max_voltage_v": 10, "max_current_a": 1, "max_power_w": 10},
+            "operating": {"max_voltage_v": 10, "max_current_a": 0.5, "max_power_w": 5},
+        }
+        load_limits = {
+            "absolute": {"max_voltage_v": 120, "max_current_a": 20, "max_power_w": 200, "max_load_resistance_ohm": 4500},
+            "operating": {"max_voltage_v": 60, "max_current_a": 5, "max_power_w": 100, "max_load_resistance_ohm": 4500},
+        }
+        envelope = effective_safety_envelope(panel_limits, load_limits, {"max_load_resistance_ohm": 4500})
+        self.assertEqual(envelope["min_load_resistance_ohm"], 20.0)
+        self.assertNotEqual(envelope["min_load_resistance_ohm"], 100.0)
+
+    def test_startup_preselects_safe_datasheet_rmpp_without_energizing(self):
+        panel = panel_config()
+        panel["config"]["panel_spec"] = {"vmp_v": 20, "imp_a": 0.02}
+        load = controller(panel=panel)
+        state = load.state()
+        self.assertEqual(state["nominal_rmpp_ohm"], 1000)
+        self.assertEqual(state["resistance_setpoint_ohm"], 1000)
+        self.assertEqual(state["resistance_source"], "datasheet")
+        self.assertFalse(state["input_enabled"])
+        self.assertNotIn("on", load.driver.commands)
+
     def test_effective_envelope_uses_most_restrictive_limits(self):
         envelope = effective_safety_envelope(
             panel_config()["config"]["limits"],
@@ -458,14 +502,34 @@ class LoadControlTest(unittest.TestCase):
         self.assertIs(load.state()["last_sweep"], failed)
         self.assertIs(load.state()["last_successful_sweep"], successful)
 
-    def test_single_shot_runs_once_and_leaves_input_off(self):
-        driver = FakeLoad([measurement(current=0, power=0), measurement(), measurement(), measurement()])
+    def test_failed_single_shot_runs_once_and_leaves_input_off(self):
+        driver = FakeLoad([measurement(current=0, power=0), measurement(current=2.0, power=32.4)])
         load = controller(driver=driver)
         results = load.run_sweep_sequence("single_shot")
         self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["electrical_status"], "safety_abort")
         self.assertFalse(load.state()["sweep_run_active"])
         self.assertFalse(driver.input_enabled)
         self.assertEqual(driver.commands[-1], "off")
+
+    def test_successful_single_shot_resumes_fixed_at_measured_rmpp(self):
+        driver = FakeLoad([
+            measurement(current=0, power=0),
+            measurement(voltage=16, current=0.01, resistance=1200),
+            measurement(voltage=15, current=0.02, resistance=1000),
+            measurement(voltage=14, current=0.01, resistance=800),
+            measurement(voltage=16, current=0, power=0, resistance=1000),
+            measurement(voltage=15, current=0.02, power=0.3, resistance=1000),
+        ])
+        load = controller(driver=driver)
+        results = load.run_sweep_sequence("single_shot")
+        state = load.state()
+        self.assertEqual(results[0]["rmpp_ohm"], 1000)
+        self.assertEqual(state["selected_mode"], "fixed_resistance")
+        self.assertEqual(state["resistance_setpoint_ohm"], 1000)
+        self.assertEqual(state["resistance_source"], "measured_sweep")
+        self.assertTrue(state["input_enabled"])
+        self.assertEqual(state["active_mode"], "fixed_resistance")
 
     def test_continuous_uses_fixed_boundary_when_sweep_finishes_at_9_9(self):
         clock = FakeClock()
@@ -513,6 +577,48 @@ class LoadControlTest(unittest.TestCase):
         self.assertEqual((results[0]["vmpp_v"], results[0]["impp_a"], results[0]["rmpp_ohm"]), (15, 0.02, 1000))
         self.assertEqual((results[1]["vmpp_v"], results[1]["impp_a"], results[1]["rmpp_ohm"]), (13, 0.03, 800))
         self.assertIs(load.state()["last_successful_sweep"], results[1])
+
+    def test_intentional_continuous_stop_resumes_fixed_at_latest_measured_rmpp(self):
+        driver = FakeLoad([
+            measurement(current=0, power=0),
+            measurement(voltage=16, current=0.01, resistance=1200),
+            measurement(voltage=15, current=0.02, resistance=1000),
+            measurement(voltage=14, current=0.01, resistance=800),
+            measurement(voltage=16, current=0, power=0, resistance=1000),
+            measurement(voltage=15, current=0.02, power=0.3, resistance=1000),
+        ])
+        load = controller(driver=driver)
+        load.sweep_result_sink = lambda _result: load.request_sweep_stop(resume_fixed=True)
+
+        results = load.run_sweep_sequence("continuous")
+
+        self.assertEqual(len(results), 1)
+        state = load.state()
+        self.assertEqual(state["active_mode"], "fixed_resistance")
+        self.assertTrue(state["input_enabled"])
+        self.assertEqual(state["resistance_setpoint_ohm"], results[0]["rmpp_ohm"])
+        self.assertEqual(state["resistance_source"], "measured_sweep")
+
+    def test_intentional_continuous_stop_without_completed_sweep_uses_nominal_rmpp(self):
+        panel = panel_config()
+        panel["config"]["panel_spec"] = {"vmp_v": 20, "imp_a": 0.02}
+        driver = FakeLoad([
+            measurement(current=0, power=0),
+            measurement(voltage=16, current=0.01, resistance=1200),
+            measurement(voltage=16, current=0, power=0, resistance=1000),
+            measurement(voltage=15, current=0.02, power=0.3, resistance=1000),
+        ])
+        load = controller(driver=driver, panel=panel)
+        driver.on_measure = lambda count: load.request_sweep_stop(resume_fixed=True) if count == 2 else None
+
+        results = load.run_sweep_sequence("continuous")
+
+        self.assertEqual(results[0]["electrical_status"], "incomplete")
+        state = load.state()
+        self.assertEqual(state["active_mode"], "fixed_resistance")
+        self.assertTrue(state["input_enabled"])
+        self.assertEqual(state["resistance_setpoint_ohm"], 1000)
+        self.assertEqual(state["resistance_source"], "datasheet")
 
     def test_continuous_overrun_is_retained_and_resumes_next_future_boundary(self):
         clock = FakeClock()

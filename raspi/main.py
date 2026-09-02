@@ -36,7 +36,6 @@ app = FastAPI(title="Solar Monitor")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
 
-run_active = False
 latest_readings_by_uid: Dict[str, Dict[str, Any]] = {}
 latest_successful_readings_by_uid: Dict[str, Dict[str, Any]] = {}
 last_recorded_signatures_by_uid: Dict[str, str] = {}
@@ -189,6 +188,7 @@ LOAD_CONTROLLERS = build_load_controllers(APP_CONFIG, DRIVERS, SWEEP_RECORDER)
 RECORDER = CsvAveragingRecorder(
     recorder_configs_from_app_config(APP_CONFIG),
     data_root=DEFAULT_RECORDING_DATA_ROOT,
+    irradiance_provider=irradiance_values_between,
 )
 BACKUP_MANAGER = DataBackupManager(
     backup_config_from_app_config(APP_CONFIG),
@@ -370,11 +370,6 @@ def is_fresh_for_recording(uid: str, reading: Dict[str, Any]) -> bool:
     return True
 
 
-def is_run_active() -> bool:
-    with state_lock:
-        return run_active
-
-
 def poll_all_drivers_once() -> None:
     for driver in DRIVERS:
         poll_driver_once(driver)
@@ -422,19 +417,16 @@ def spn1_acquisition_loop(stop_event: threading.Event = shutdown_event) -> None:
         return
 
     while not stop_event.is_set():
-        if is_run_active():
-            poll_driver_once(driver)
-        else:
-            stop_event.wait(0.2)
+        poll_driver_once(driver)
+        stop_event.wait(1.0)
 
 
 def drivers_due_for_polling(drivers: List[Any], run_is_active: bool) -> List[Any]:
-    if run_is_active:
-        return drivers
     due = []
     for driver in drivers:
         controller = LOAD_CONTROLLERS.get(getattr(driver, "uid", ""))
         if controller is None:
+            due.append(driver)
             continue
         state = controller.state()
         transport_needs_recovery = state.get("transport_state") in {"disconnected", "reconnecting", "fault"}
@@ -443,11 +435,10 @@ def drivers_due_for_polling(drivers: List[Any], run_is_active: bool) -> List[Any
     return due
 
 
-def generic_polling_loop(stop_event: threading.Event = shutdown_event, poll_interval_s: float = 10.0) -> None:
+def generic_polling_loop(stop_event: threading.Event = shutdown_event, poll_interval_s: float = 1.0) -> None:
     drivers = polled_drivers()
     while not stop_event.is_set():
-        run_is_active = is_run_active()
-        due_drivers = drivers_due_for_polling(drivers, run_is_active)
+        due_drivers = drivers_due_for_polling(drivers, True)
         if due_drivers:
             for driver in due_drivers:
                 if stop_event.is_set():
@@ -457,7 +448,7 @@ def generic_polling_loop(stop_event: threading.Event = shutdown_event, poll_inte
                     controller_state = controller.state()
                     if controller_state["sweep_state"] == "running" or controller_state.get("sweep_run_active"):
                         continue
-                poll_driver_once(driver, record=run_is_active)
+                poll_driver_once(driver, record=True)
             stop_event.wait(poll_interval_s)
         else:
             stop_event.wait(0.2)
@@ -465,8 +456,6 @@ def generic_polling_loop(stop_event: threading.Event = shutdown_event, poll_inte
 
 def recorder_flush_loop(stop_event: threading.Event = shutdown_event, flush_interval_s: float = 0.25) -> None:
     while not stop_event.wait(flush_interval_s):
-        if not is_run_active():
-            continue
         try:
             RECORDER.flush_due()
         except Exception as exc:
@@ -559,6 +548,7 @@ def get_spn1_driver() -> SPN1Driver:
 @app.on_event("startup")
 def start_background_reader() -> None:
     shutdown_event.clear()
+    RECORDER.start()
 
     spn1_thread = threading.Thread(target=spn1_acquisition_loop, daemon=True)
     spn1_thread.start()
@@ -639,7 +629,7 @@ def get_app_health():
             "status": "ok" if DRIVERS else "degraded",
             "time_status": time_status(),
             "driver_count": len(DRIVERS),
-            "run_active": is_run_active(),
+            "acquisition_active": True,
             "spn1_time_sync": get_spn1_sync_status(),
             "recording": RECORDER.status(),
             "backup": BACKUP_MANAGER.status(),
@@ -664,7 +654,7 @@ def get_latest_readings():
 def get_state():
     return JSONResponse(
         {
-            "run_active": is_run_active(),
+            "acquisition_active": True,
             "latest_reading": latest_primary_reading(),
             "latest_spn1_reading": latest_spn1_reading(),
             "latest_readings": latest_readings(),
@@ -788,7 +778,10 @@ async def apply_fixed_load(uid: str, request: Request):
 async def disable_load(uid: str, request: Request):
     payload = await request.json()
     try:
-        return JSONResponse(get_load_controller(uid).disable(bool(payload.get("clear_fault", False))))
+        controller = get_load_controller(uid)
+        if controller.state()["sweep_run_active"]:
+            return JSONResponse(controller.request_sweep_stop(resume_fixed=True))
+        return JSONResponse(controller.disable(bool(payload.get("clear_fault", False))))
     except Exception as exc:
         return load_error_response(exc)
 
@@ -815,27 +808,3 @@ async def select_sweep_run_mode(uid: str, request: Request):
         return JSONResponse(get_load_controller(uid).select_sweep_run_mode(payload.get("run_mode")))
     except Exception as exc:
         return load_error_response(exc)
-
-
-@app.post("/start")
-def start_run():
-    global run_active
-    with state_lock:
-        run_active = True
-        last_recorded_signatures_by_uid.clear()
-    RECORDER.start()
-    return JSONResponse({"run_active": True})
-
-
-@app.post("/stop")
-def stop_run():
-    global run_active
-    for controller in LOAD_CONTROLLERS.values():
-        try:
-            controller.disable()
-        except Exception as exc:
-            logger.warning("Electronic load stop failed for %s: %s", controller.uid, exc)
-    with state_lock:
-        run_active = False
-    RECORDER.stop()
-    return JSONResponse({"run_active": False})

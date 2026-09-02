@@ -20,6 +20,14 @@
         "host": "REPLACE_WITH_ESP32_IP",
         "port": 1234,
         "timeout_s": 3,
+        "panel_spec": {
+          "voc_v": 8.51,
+          "vmp_v": 7.28,
+          "imp_a": 0.33,
+          "isc_a": null,
+          "pmp_w": 2.37,
+          "power_tolerance_pct": 10
+        },
         "limits": {
           "absolute": {
             "max_voltage_v": "REPLACE_WITH_PANEL_MANUFACTURER_RATING",
@@ -77,25 +85,17 @@
             "max_voltage_v": "REPLACE_WITH_CONSERVATIVE_WORKING_LIMIT",
             "max_current_a": "REPLACE_WITH_CONSERVATIVE_WORKING_LIMIT",
             "max_power_w": "REPLACE_WITH_CONSERVATIVE_WORKING_LIMIT",
-            "min_load_resistance_ohm": "REPLACE_WITH_SAFE_SYSTEM_MINIMUM",
             "max_load_resistance_ohm": 4500
           }
         },
         "cr": {
-          "default_resistance_ohm": 800,
-          "min_load_resistance_ohm": "REPLACE_WITH_SAFE_SYSTEM_MINIMUM",
           "max_load_resistance_ohm": 4500
         },
         "sweep": {
           "interval_s": 10,
           "settle_s": 0.5,
-          "min_load_resistance_ohm": "REPLACE_WITH_SAFE_SYSTEM_MINIMUM",
           "max_load_resistance_ohm": 4500,
-          "resistance_values_ohm": [
-            "REPLACE_WITH_SAFE_HIGH_RESISTANCE",
-            "REPLACE_WITH_SAFE_INTERMEDIATE_RESISTANCE",
-            "REPLACE_WITH_SAFE_LOW_RESISTANCE"
-          ]
+          "point_count": 12
         },
         "irradiance_quality": {
           "max_std_w_m2": "REPLACE_WITH_STUDY_THRESHOLD",

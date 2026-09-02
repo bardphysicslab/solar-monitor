@@ -563,9 +563,7 @@
             <div class="clock-utc" id="clock-utc">UTC --</div>
           </div>
           <div class="controls">
-            <button class="button-start" type="button" id="start-button">Start</button>
-            <button type="button" id="stop-button">Stop</button>
-            <div class="status status-stopped" id="run-status">Stopped</div>
+            <div class="status status-running">Continuous acquisition</div>
           </div>
         </div>
       </div>
@@ -614,7 +612,6 @@
       const maxPoints = 100;
       const totalValueEl = document.getElementById("total-value");
       const diffuseValueEl = document.getElementById("diffuse-value");
-      const runStatusEl = document.getElementById("run-status");
       const clockLocalEl = document.getElementById("clock-local");
       const clockUtcEl = document.getElementById("clock-utc");
       const sunValueEl = document.getElementById("sun-value");
@@ -623,7 +620,6 @@
       const openSolarDetails = new Set();
       let loadStatesByUid = new Map();
       let lastSpn1Timestamp = null;
-      let runActive = false;
 
       Chart.defaults.color = "#a7a7a7";
       Chart.defaults.borderColor = "rgba(255, 255, 255, 0.12)";
@@ -832,7 +828,6 @@
       }
 
       function nodeState(reading) {
-        if (!runActive) return "STOPPED";
         if (!reading) return "WAITING";
         if (reading.status === "ok") return "LIVE";
         return "OFFLINE";
@@ -962,7 +957,7 @@
         const transportUnconfirmed = state.safety_state === "disconnected_unconfirmed";
         const canConfigure = Boolean(state.safety_config_complete) && !transportUnconfirmed && !state.active_mode && !state.sweep_run_active;
         const canStep = Boolean(state.safety_config_complete) && state.sweep_state !== "running";
-        const canEnable = fixedSelected && canConfigure;
+        const canEnable = fixedSelected && canConfigure && Number.isFinite(state.resistance_setpoint_ohm);
         const canApply = state.active_mode === "fixed_resistance" && state.input_enabled
           && state.applied_resistance_ohm !== state.resistance_setpoint_ohm;
         const sweepConfig = state.sweep_config || {};
@@ -1010,6 +1005,9 @@
               ${fixedSelected ? `
                 <div class="wifi-detail-grid" data-fixed-resistance-controls>
                   ${detailRow("Selected resistance", formatResistanceKohm(state.resistance_setpoint_ohm))}
+                  ${detailRow("Source", state.resistance_source === "measured_sweep" ? "Measured RMPP" : state.resistance_source === "datasheet" ? "Datasheet RMPP" : state.resistance_source === "manual" ? "Manual" : null)}
+                  ${detailRow("Nominal RMPP", formatResistance(state.nominal_rmpp_ohm))}
+                  ${detailRow("Measured RMPP", formatResistance(state.measured_rmpp_ohm))}
                   ${detailRow("Applied resistance", state.input_enabled ? formatResistanceKohm(state.applied_resistance_ohm) : null)}
                 </div>
                 <div class="digit-stepper-wrap" aria-label="Fixed resistance digit stepper">
@@ -1022,6 +1020,8 @@
                   </div>
                 </div>
                 <div class="load-actions">
+                  <input type="number" min="0.05" step="0.01" data-manual-resistance data-load-uid="${escapeHtml(loadUid)}" placeholder="Manual Ω" />
+                  <button type="button" data-load-action="set-manual" data-load-uid="${escapeHtml(loadUid)}" ${canConfigure ? "" : "disabled"}>Set Manual</button>
                   <button type="button" data-load-action="enable-fixed" data-load-uid="${escapeHtml(loadUid)}" ${canEnable ? "" : "disabled"}>Enable Fixed Load</button>
                   <button type="button" data-load-action="apply-fixed" data-load-uid="${escapeHtml(loadUid)}" ${canApply ? "" : "disabled"}>Apply</button>
                   <button type="button" class="load-stop" data-load-action="disable" data-load-uid="${escapeHtml(loadUid)}" ${canStop ? "" : "disabled"}>Stop / Disable</button>
@@ -1101,6 +1101,10 @@
         } else if (action === "step") {
           path = `/loads/${encodeURIComponent(uid)}/step`;
           payload = { step_ohm: Number(element.dataset.stepOhm), direction: Number(element.dataset.direction) };
+        } else if (action === "set-manual") {
+          const input = wifiNodeListEl.querySelector(`[data-manual-resistance][data-load-uid="${CSS.escape(uid)}"]`);
+          path = `/loads/${encodeURIComponent(uid)}/select`;
+          payload = { mode: "fixed_resistance", resistance_ohm: Number(input?.value) };
         } else if (action === "enable-fixed") {
           path = `/loads/${encodeURIComponent(uid)}/fixed/enable`;
         } else if (action === "apply-fixed") {
@@ -1236,23 +1240,9 @@
         restoreSolarDetailOpenState();
       }
 
-      async function setRunActive(active) {
-        await fetch(active ? "/start" : "/stop", { method: "POST" });
-        await refreshState();
-        await refreshWifiNodes();
-      }
-
-      function showRunState(runActive) {
-        runStatusEl.textContent = runActive ? "Running" : "Stopped";
-        runStatusEl.classList.toggle("status-running", runActive);
-        runStatusEl.classList.toggle("status-stopped", !runActive);
-      }
-
       async function refreshState() {
         const stateResponse = await fetch("/state");
         const state = await stateResponse.json();
-        runActive = Boolean(state.run_active);
-        showRunState(runActive);
         updateSpn1Reading(state.latest_spn1_reading);
       }
 
@@ -1269,14 +1259,6 @@
         clockLocalEl.textContent = time.local || "--:--:--";
         clockUtcEl.textContent = `UTC ${time.utc || "--"}`;
       }
-
-      document.getElementById("start-button").addEventListener("click", () => {
-        setRunActive(true).catch(console.error);
-      });
-
-      document.getElementById("stop-button").addEventListener("click", () => {
-        setRunActive(false).catch(console.error);
-      });
 
       wifiNodeListEl.addEventListener("click", (event) => {
         const point = event.target.closest("[data-sweep-point]");

@@ -58,7 +58,7 @@ class FailingOnceRecorder(CsvAveragingRecorder):
 
 
 class CsvRecorderTest(unittest.TestCase):
-    def make_recorder(self, configs, root):
+    def make_recorder(self, configs, root, irradiance_provider=None):
         self.clock = FakeClock()
         recorder = CsvAveragingRecorder(
             configs,
@@ -66,6 +66,7 @@ class CsvRecorderTest(unittest.TestCase):
             monotonic_fn=lambda: self.clock.monotonic,
             utcnow_fn=lambda: self.clock.utcnow,
             fsync=False,
+            irradiance_provider=irradiance_provider,
         )
         recorder.start()
         return recorder
@@ -254,6 +255,39 @@ class CsvRecorderTest(unittest.TestCase):
             self.assertEqual(row["resistance_setpoint_ohm"], "800.0000")
             self.assertEqual(row["safety_state"], "active")
             self.assertNotIn("panel_voltage_1_v", row)
+
+    def test_et54_window_includes_synchronized_spn1_statistics_and_valid_counts(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            calls = []
+
+            def irradiance(start, end):
+                calls.append((start, end))
+                return [500, 510, 490]
+
+            recorder = self.make_recorder(
+                [RecorderConfig("load-001", "et54", enabled=True, interval_s=10)],
+                temp_dir,
+                irradiance_provider=irradiance,
+            )
+            for voltage in (16.0, 16.2):
+                recorder.add_reading(
+                    "load-001",
+                    {
+                        "status": "ok",
+                        "data": {"voltage_v": voltage, "current_a": 0.01, "power_w": 0.16},
+                        "extended": {"panel_uid": "panel-001", "load_uid": "load-001"},
+                    },
+                )
+                self.clock.advance(5)
+            recorder.flush_due()
+            row = self.rows_for(temp_dir, "load-001")[0]
+            self.assertEqual(row["valid_electrical_sample_count"], "2")
+            self.assertEqual(row["valid_irradiance_sample_count"], "3")
+            self.assertEqual(row["irradiance_mean_w_m2"], "500.000")
+            self.assertEqual(row["irradiance_min_w_m2"], "490.000")
+            self.assertEqual(row["irradiance_max_w_m2"], "510.000")
+            self.assertEqual(row["irradiance_std_w_m2"], "8.165")
+            self.assertEqual(calls, [(row["window_start_utc"], row["window_end_utc"])])
 
     def test_solar_window_maps_single_channel_and_blanks_missing_values(self):
         with tempfile.TemporaryDirectory() as temp_dir:

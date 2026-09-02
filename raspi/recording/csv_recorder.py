@@ -2,6 +2,7 @@ import csv
 import logging
 import math
 import os
+import statistics
 import threading
 import time
 from dataclasses import dataclass
@@ -30,6 +31,7 @@ ET54_HEADER = [
     "window_start_utc",
     "window_end_utc",
     "sample_count",
+    "valid_electrical_sample_count",
     "voltage_v",
     "current_a",
     "power_w",
@@ -40,6 +42,11 @@ ET54_HEADER = [
     "active_mode",
     "resistance_setpoint_ohm",
     "safety_state",
+    "irradiance_mean_w_m2",
+    "irradiance_min_w_m2",
+    "irradiance_max_w_m2",
+    "irradiance_std_w_m2",
+    "valid_irradiance_sample_count",
 ]
 
 SOLAR_HEADER = [
@@ -207,12 +214,14 @@ class CsvAveragingRecorder:
         monotonic_fn: Callable[[], float] = time.monotonic,
         utcnow_fn: Callable[[], datetime] = utc_now,
         fsync: bool = True,
+        irradiance_provider: Optional[Callable[[str, str], List[float]]] = None,
     ):
         self.configs = {config.uid: config for config in configs}
         self.data_root = Path(data_root)
         self.monotonic_fn = monotonic_fn
         self.utcnow_fn = utcnow_fn
         self.fsync = fsync
+        self.irradiance_provider = irradiance_provider or (lambda _start, _end: [])
         self.active = False
         self.windows: Dict[str, AveragingWindow] = {}
         self.lock = threading.RLock()
@@ -391,8 +400,14 @@ class CsvAveragingRecorder:
             return base
 
         if config.driver_name == "et54":
+            irradiance_values = [
+                float(value)
+                for value in self.irradiance_provider(iso_utc(window.start_utc), iso_utc(end_utc))
+                if is_valid_number(value)
+            ]
             base.update(
                 {
+                    "valid_electrical_sample_count": str(window.numeric_counts.get("voltage_v", 0)),
                     "voltage_v": self._format_mean(window, "voltage_v", 4),
                     "current_a": self._format_mean(window, "current_a", 4),
                     "power_w": self._format_mean(window, "power_w", 4),
@@ -403,6 +418,11 @@ class CsvAveragingRecorder:
                     "active_mode": (getattr(window, "latest_strings", {}) or {}).get("active_mode") or "",
                     "resistance_setpoint_ohm": self._format_mean(window, "resistance_setpoint_ohm", 4),
                     "safety_state": (getattr(window, "latest_strings", {}) or {}).get("safety_state") or "",
+                    "irradiance_mean_w_m2": f"{statistics.fmean(irradiance_values):.3f}" if irradiance_values else "",
+                    "irradiance_min_w_m2": f"{min(irradiance_values):.3f}" if irradiance_values else "",
+                    "irradiance_max_w_m2": f"{max(irradiance_values):.3f}" if irradiance_values else "",
+                    "irradiance_std_w_m2": f"{statistics.pstdev(irradiance_values):.3f}" if irradiance_values else "",
+                    "valid_irradiance_sample_count": str(len(irradiance_values)),
                 }
             )
             return base

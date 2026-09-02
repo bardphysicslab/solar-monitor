@@ -11,6 +11,8 @@ from typing import Any, Callable, ContextManager, Dict, Iterable, List, Optional
 
 SUPPORTED_MODES = {"fixed_resistance", "sweep"}
 REQUIRED_ELECTRICAL_LIMITS = ("max_voltage_v", "max_current_a", "max_power_w")
+ET54_HARDWARE_MIN_RESISTANCE_OHM = 0.05
+ET54_HARDWARE_MAX_RESISTANCE_OHM = 4500.0
 
 
 class ElectronicLoadDriver(Protocol):
@@ -67,6 +69,31 @@ def resistance_step(value_ohm: float, step_ohm: float, direction: int, minimum: 
     return min(maximum, max(minimum, round(value + direction * step, 6)))
 
 
+def nominal_rmpp_ohm(panel_spec: Dict[str, Any]) -> Optional[float]:
+    voltage = numeric((panel_spec or {}).get("vmp_v"))
+    current = numeric((panel_spec or {}).get("imp_a"))
+    if voltage is None or voltage <= 0 or current is None or current <= 0:
+        return None
+    return voltage / current
+
+
+def automatic_sweep_values(nominal_ohm: float, minimum_ohm: float, maximum_ohm: float, point_count: int = 12) -> List[float]:
+    nominal = numeric(nominal_ohm)
+    minimum = numeric(minimum_ohm)
+    maximum = numeric(maximum_ohm)
+    if nominal is None or minimum is None or maximum is None or minimum <= 0 or maximum <= minimum:
+        raise SafetyConfigurationError("automatic sweep requires a valid nominal RMPP and safe resistance range")
+    if not minimum < nominal < maximum:
+        raise SafetyConfigurationError(
+            f"safe resistance range {minimum:.3g}-{maximum:.3g} ohm does not bracket nominal RMPP {nominal:.3g} ohm"
+        )
+    if point_count < 5:
+        raise SafetyConfigurationError("automatic sweep requires at least five points")
+    ratio = (maximum / minimum) ** (1.0 / (point_count - 2))
+    generated = [maximum / (ratio ** index) for index in range(point_count - 1)] + [minimum, nominal]
+    return sorted({round(value, 6) for value in generated}, reverse=True)
+
+
 def _limit(profile: Dict[str, Any], name: str) -> Optional[float]:
     return numeric((profile or {}).get(name))
 
@@ -87,6 +114,7 @@ def effective_safety_envelope(panel_limits: Dict[str, Any], load_limits: Dict[st
     load_absolute = load_limits.get("absolute") or {}
     load_operating = load_limits.get("operating") or {}
     maximum_candidates = [
+        ET54_HARDWARE_MAX_RESISTANCE_OHM,
         _limit(load_absolute, "max_load_resistance_ohm"),
         _limit(load_operating, "max_load_resistance_ohm"),
         numeric(mode_config.get("max_load_resistance_ohm")),
@@ -116,6 +144,7 @@ def effective_safety_envelope(panel_limits: Dict[str, Any], load_limits: Dict[st
         _limit(load_operating, "max_power_w") or math.inf,
     )
     minimum_candidates = [
+        ET54_HARDWARE_MIN_RESISTANCE_OHM,
         _limit(load_absolute, "min_load_resistance_ohm"),
         _limit(load_operating, "min_load_resistance_ohm"),
         numeric(mode_config.get("min_load_resistance_ohm")),
@@ -167,9 +196,14 @@ class ElectronicLoadController:
         self.monotonic_fn = monotonic_fn
         self._lock = threading.RLock()
         self.selected_mode = load_config.get("default_selected_mode", "fixed_resistance")
-        self.selected_resistance_ohm = float(
-            (load_config.get("cr") or {}).get("default_resistance_ohm", load_config.get("resistance_ohm", 100))
+        self.panel_spec = ((panel_config or {}).get("config") or {}).get("panel_spec") or {}
+        self.nominal_rmpp_ohm = nominal_rmpp_ohm(self.panel_spec)
+        self.measured_rmpp_ohm = None
+        configured_resistance = numeric(
+            (load_config.get("cr") or {}).get("default_resistance_ohm", load_config.get("resistance_ohm"))
         )
+        self.selected_resistance_ohm = self.nominal_rmpp_ohm if self.nominal_rmpp_ohm is not None else configured_resistance
+        self.resistance_source = "datasheet" if self.nominal_rmpp_ohm is not None else ("manual" if configured_resistance else None)
         self.applied_resistance_ohm = None
         self.active_mode = None
         self.input_enabled = False
@@ -186,7 +220,14 @@ class ElectronicLoadController:
         self._sweep_durations: List[float] = []
         self.overrun_count = 0
         self.skipped_boundary_count = 0
+        self._resume_fixed_after_stop = False
         self._refresh_readiness()
+        if self.selected_resistance_ohm is not None:
+            try:
+                self._validate_resistance(self.selected_resistance_ohm, mode="fixed_resistance")
+            except LoadControlError:
+                self.selected_resistance_ohm = None
+                self.resistance_source = None
 
     def _refresh_readiness(self) -> None:
         try:
@@ -242,6 +283,10 @@ class ElectronicLoadController:
                 "transport_state": getattr(self.driver, "transport_state", "connected"),
                 "transport_message": getattr(self.driver, "transport_message", None),
                 "resistance_setpoint_ohm": self.selected_resistance_ohm,
+                "nominal_rmpp_ohm": self.nominal_rmpp_ohm,
+                "measured_rmpp_ohm": self.measured_rmpp_ohm,
+                "active_resistance_ohm": self.applied_resistance_ohm if self.input_enabled else None,
+                "resistance_source": self.resistance_source,
                 "applied_resistance_ohm": self.applied_resistance_ohm,
                 "sweep_state": self.sweep_state,
                 "sweep_run_mode": self.sweep_run_mode,
@@ -275,6 +320,7 @@ class ElectronicLoadController:
             if resistance_ohm is not None:
                 self._validate_resistance(float(resistance_ohm), mode="fixed_resistance")
                 self.selected_resistance_ohm = float(resistance_ohm)
+                self.resistance_source = "manual"
             self._refresh_readiness()
             return self.state()
 
@@ -317,6 +363,8 @@ class ElectronicLoadController:
 
     def select_resistance_step(self, step_ohm: float, direction: int) -> Dict[str, Any]:
         with self._lock:
+            if self.selected_resistance_ohm is None:
+                raise LoadControlError("No safe automatic resistance is available; enter a validated manual value")
             envelope = self.safety_envelope("fixed_resistance")
             selected = resistance_step(
                 self.selected_resistance_ohm,
@@ -402,6 +450,26 @@ class ElectronicLoadController:
                 self.safety_message = "Load disabled"
             return self.state()
 
+    def request_sweep_stop(self, resume_fixed: bool = True) -> Dict[str, Any]:
+        with self._lock:
+            if not self.sweep_run_active:
+                return self.disable()
+            self._resume_fixed_after_stop = bool(resume_fixed and self.sweep_run_mode == "continuous")
+            self._stop_requested.set()
+            self.safety_message = "Stopping sweep safely"
+            return self.state()
+
+    def _enable_fixed_target(self, resistance_ohm: Any, source: str) -> Dict[str, Any]:
+        value = numeric(resistance_ohm)
+        if value is None:
+            raise SafetyConfigurationError("No valid resistance is available for Fixed Resistance")
+        self._validate_resistance(value, mode="fixed_resistance")
+        with self._lock:
+            self.selected_mode = "fixed_resistance"
+            self.selected_resistance_ohm = value
+            self.resistance_source = source
+        return self.enable_fixed()
+
     def poll_reading(self) -> Dict[str, Any]:
         with self._lock:
             if self.sweep_state == "running":
@@ -461,7 +529,13 @@ class ElectronicLoadController:
         except (TypeError, ValueError) as exc:
             raise SafetyConfigurationError("sweep resistance values must be numeric") from exc
         if not values:
-            raise SafetyConfigurationError("sweep.resistance_values_ohm is required")
+            envelope = self.safety_envelope("sweep")
+            values = automatic_sweep_values(
+                self.nominal_rmpp_ohm,
+                envelope["min_load_resistance_ohm"],
+                envelope["max_load_resistance_ohm"],
+                int(sweep_config.get("point_count", 12)),
+            )
         if values != sorted(values, reverse=True):
             raise SafetyConfigurationError("sweep resistance values must be high-to-low")
         for value in values:
@@ -605,6 +679,7 @@ class ElectronicLoadController:
             self.last_sweep = result
             if electrical_status == "complete":
                 self.last_successful_sweep = result
+                self.measured_rmpp_ohm = result.get("rmpp_ohm")
                 self._sweep_durations.append(duration_s)
                 if timing_status == "overrun":
                     self.overrun_count += 1
@@ -644,6 +719,7 @@ class ElectronicLoadController:
         cadence_origin = self.monotonic_fn()
         cadence_origin_wall = datetime.now(timezone.utc)
         boundary_index = 0
+        resume_fixed_after_stop = False
         try:
             while not self._stop_requested.is_set():
                 scheduled_monotonic = cadence_origin + boundary_index * interval_s
@@ -688,6 +764,30 @@ class ElectronicLoadController:
                         self.input_enabled = False
                     self.active_mode = None
                     self.sweep_run_active = False
+                    resume_fixed_after_stop = self._resume_fixed_after_stop
+                    self._resume_fixed_after_stop = False
+        if selected_run_mode == "single_shot" and results and results[-1]["electrical_status"] == "complete":
+            try:
+                self._enable_fixed_target(results[-1].get("rmpp_ohm"), "measured_sweep")
+            except Exception as exc:
+                with self._lock:
+                    self.safety_state = "instrument_error" if not isinstance(exc, SafetyViolation) else "safety_fault"
+                    self.safety_message = f"Sweep completed but Fixed Resistance could not resume: {exc}"
+                    self.input_enabled = False
+                    self.active_mode = None
+        elif selected_run_mode == "continuous" and resume_fixed_after_stop:
+            target = self.measured_rmpp_ohm if self.measured_rmpp_ohm is not None else self.nominal_rmpp_ohm
+            source = "measured_sweep" if self.measured_rmpp_ohm is not None else "datasheet"
+            try:
+                self._enable_fixed_target(target, source)
+                with self._lock:
+                    self.safety_message = f"Fixed Resistance resumed using {source.replace('_', ' ')} RMPP"
+            except Exception as exc:
+                with self._lock:
+                    self.safety_state = "instrument_error" if not isinstance(exc, SafetyViolation) else "safety_fault"
+                    self.safety_message = f"Continuous sweep stopped; Fixed Resistance remains OFF: {exc}"
+                    self.input_enabled = False
+                    self.active_mode = None
         return results
 
     def _validate_resistance(self, value: float, mode: Optional[str] = None, envelope: Optional[Dict[str, float]] = None) -> None:

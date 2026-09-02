@@ -48,7 +48,6 @@ class MainMultiDeviceTest(unittest.TestCase):
     def setUp(self):
         self.original_drivers = main.DRIVERS
         self.original_primary = main.PRIMARY_DRIVER
-        self.original_run_active = main.run_active
         self.original_readings = dict(main.latest_readings_by_uid)
         self.original_successful_readings = dict(main.latest_successful_readings_by_uid)
         self.original_signatures = dict(main.last_recorded_signatures_by_uid)
@@ -91,7 +90,6 @@ class MainMultiDeviceTest(unittest.TestCase):
         main.latest_readings_by_uid = {}
         main.latest_successful_readings_by_uid = {}
         main.last_recorded_signatures_by_uid = {}
-        main.run_active = False
         main.RECORDER = FakeRecorder()
         main.BACKUP_MANAGER = FakeBackupManager()
         main.LOAD_CONTROLLERS = {}
@@ -99,7 +97,6 @@ class MainMultiDeviceTest(unittest.TestCase):
     def tearDown(self):
         main.DRIVERS = self.original_drivers
         main.PRIMARY_DRIVER = self.original_primary
-        main.run_active = self.original_run_active
         main.latest_readings_by_uid = self.original_readings
         main.latest_successful_readings_by_uid = self.original_successful_readings
         main.last_recorded_signatures_by_uid = self.original_signatures
@@ -111,14 +108,21 @@ class MainMultiDeviceTest(unittest.TestCase):
         self.assertTrue(any(isinstance(driver, SPN1Driver) for driver in main.DRIVERS))
         self.assertTrue(any(isinstance(driver, WiFiNodeDriver) for driver in main.DRIVERS))
 
-    def test_start_and_stop_toggle_global_polling_state(self):
-        main.start_run()
-        self.assertTrue(main.is_run_active())
-        self.assertEqual(main.RECORDER.started, 1)
+    def test_spn1_acquires_continuously_without_global_start(self):
+        stop_event = threading.Event()
 
-        main.stop_run()
-        self.assertFalse(main.is_run_active())
-        self.assertEqual(main.RECORDER.stopped, 1)
+        def read_and_stop():
+            stop_event.set()
+            return self.spn1_reading
+
+        self.spn1.get_reading = read_and_stop
+        main.spn1_acquisition_loop(stop_event)
+        self.assertEqual(main.latest_readings_by_uid[self.spn1.uid], self.spn1_reading)
+
+    def test_acquisition_has_no_global_start_stop_control(self):
+        self.assertFalse(hasattr(main, "is_run_active"))
+        self.assertFalse(hasattr(main, "start_run"))
+        self.assertFalse(hasattr(main, "stop_run"))
 
     def test_spn1_routes_still_exist(self):
         paths = {route.path for route in main.app.routes}
@@ -126,14 +130,14 @@ class MainMultiDeviceTest(unittest.TestCase):
         self.assertIn("/spn1/status", paths)
         self.assertIn("/spn1/time", paths)
         self.assertIn("/spn1/time/sync", paths)
-        self.assertIn("/start", paths)
-        self.assertIn("/stop", paths)
+        self.assertNotIn("/start", paths)
+        self.assertNotIn("/stop", paths)
 
     def test_application_does_not_schedule_backup_loop(self):
         self.assertFalse(hasattr(main, "backup_loop"))
 
-    def test_generic_background_measurement_cadence_is_ten_seconds(self):
-        self.assertEqual(inspect.signature(main.generic_polling_loop).parameters["poll_interval_s"].default, 10.0)
+    def test_generic_background_measurement_cadence_is_one_second(self):
+        self.assertEqual(inspect.signature(main.generic_polling_loop).parameters["poll_interval_s"].default, 1.0)
 
     def test_disconnected_configured_load_is_due_for_bounded_background_reconnect(self):
         class Driver:
@@ -385,7 +389,7 @@ class MainMultiDeviceTest(unittest.TestCase):
                 "load_resistance_ohm": 1686.3,
             },
         )
-        self.assertEqual(main.RECORDER.samples, [])
+        self.assertEqual(len(main.RECORDER.samples), 1)
 
     def test_failed_poll_preserves_previous_successful_reading_and_exposes_error(self):
         class Controller:
