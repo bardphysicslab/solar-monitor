@@ -2,19 +2,33 @@
 """Generate disposable local diagnostics and optionally sync them with rclone."""
 
 import argparse
+import json
 import os
 import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import List
+from typing import Any, List
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 REPORTS_DIR = REPO_ROOT / "reports"
 GIT_REPORT = REPORTS_DIR / "git_diff.txt"
+ACTIVE_CONFIG_REPORT = REPORTS_DIR / "active_config_report.txt"
+LIVE_CONFIG = REPO_ROOT / "raspi" / "config" / "app_config.json"
 SYNC_SCRIPT = REPO_ROOT / "scripts" / "sync_app_config.py"
 RCLONE_ENV = "BARDBOX_REPORTS_RCLONE_TARGET"
+SENSITIVE_KEYS = {
+    "token",
+    "password",
+    "passwd",
+    "secret",
+    "client_secret",
+    "api_key",
+    "apikey",
+    "access_token",
+    "refresh_token",
+}
 
 
 def run(command: List[str], *, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -63,6 +77,40 @@ HEAD: {head}
     return GIT_REPORT
 
 
+def redact(value: Any) -> Any:
+    if isinstance(value, dict):
+        redacted = {}
+        for key, item in value.items():
+            if str(key).lower() in SENSITIVE_KEYS:
+                redacted[key] = "<redacted>"
+            else:
+                redacted[key] = redact(item)
+        return redacted
+    if isinstance(value, list):
+        return [redact(item) for item in value]
+    return value
+
+
+def generate_active_config_report() -> Path | None:
+    if not LIVE_CONFIG.exists():
+        return None
+
+    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+    config = json.loads(LIVE_CONFIG.read_text(encoding="utf-8"))
+    snapshot = redact(config)
+    timestamp = datetime.now(timezone.utc).isoformat()
+    report = (
+        "BardBox Redacted Active Config Snapshot\n"
+        f"Generated UTC: {timestamp}\n"
+        f"Source: {LIVE_CONFIG}\n"
+        "Sensitive values are redacted.\n\n"
+        + json.dumps(snapshot, indent=2, sort_keys=True)
+        + "\n"
+    )
+    ACTIVE_CONFIG_REPORT.write_text(report, encoding="utf-8")
+    return ACTIVE_CONFIG_REPORT
+
+
 def generate_config_report() -> int:
     result = subprocess.run(
         [sys.executable, str(SYNC_SCRIPT), "--dry-run"],
@@ -90,7 +138,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--no-config",
         action="store_true",
-        help="Skip config_sync_report.txt generation",
+        help="Skip config_sync_report.txt and active_config_report.txt generation",
     )
     parser.add_argument(
         "--no-git",
@@ -111,6 +159,11 @@ def main() -> int:
 
     if not args.no_config:
         exit_code = generate_config_report()
+        path = generate_active_config_report()
+        if path:
+            print(f"Active config report: {path}")
+        else:
+            print(f"Active config report skipped: {LIVE_CONFIG} does not exist")
 
     if not args.no_git:
         path = generate_git_report()
