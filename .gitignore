@@ -8,6 +8,7 @@ data/*
 !data/.gitkeep
 reports/config_sync_report.txt
 reports/git_diff.txt
+reports/active_config_report.txt
 # local runtime + config
 raspi/venv/
 raspi/config/app_config.json
