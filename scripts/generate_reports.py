@@ -8,7 +8,7 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, List
+from typing import Any, List, Optional
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -91,7 +91,7 @@ def redact(value: Any) -> Any:
     return value
 
 
-def generate_active_config_report() -> Path | None:
+def generate_active_config_report() -> Optional[Path]:
     if not LIVE_CONFIG.exists():
         return None
 
