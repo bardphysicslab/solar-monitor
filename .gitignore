@@ -12,3 +12,5 @@ reports/active_config_report.txt
 # local runtime + config
 raspi/venv/
 raspi/config/app_config.json
+# Hand-made backups of the live config: deployment values, never commit
+raspi/config/*.backup*
